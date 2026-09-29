@@ -222,7 +222,7 @@ def _with_lock(
     try:
         code, stdout = invoke(
             buzz_runner,
-            send_argv(binary, channel_id),
+            send_argv(binary, channel_id, target.public_key_hex),
             child_env,
             delegation_stdin(delegation_id, task),
             on_started=on_started,

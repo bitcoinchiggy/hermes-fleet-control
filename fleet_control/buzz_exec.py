@@ -125,8 +125,26 @@ def open_dm_argv(binary: str, public_hex: str) -> list[str]:
     return [binary, "dms", "open", "--pubkey", public_hex]
 
 
-def send_argv(binary: str, channel_id: str) -> list[str]:
-    return [binary, "messages", "send", "--channel", channel_id, "--content", "-"]
+def send_argv(binary: str, channel_id: str, public_hex: str) -> list[str]:
+    """Address one already-authorized worker with ``--mention``.
+
+    Buzz turns that hex pubkey into a message ``p`` tag. The value is the
+    Fleet-resolved worker key, not a caller-supplied mention, channel, or
+    pubkey. ``--content -`` stays last so the task remains on stdin.
+    """
+    if not UUID_RE.fullmatch(channel_id) or not HEX64_RE.fullmatch(public_hex):
+        raise fail("helper_failed")
+    return [
+        binary,
+        "messages",
+        "send",
+        "--channel",
+        channel_id,
+        "--mention",
+        public_hex,
+        "--content",
+        "-",
+    ]
 
 
 def delegation_stdin(delegation_id: str, task: str) -> bytes:

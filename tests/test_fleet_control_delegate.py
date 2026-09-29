@@ -18,7 +18,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from fleet_control.buzz_exec import BuzzTimeout, delegation_stdin
+from fleet_control.buzz_exec import BuzzTimeout, delegation_stdin, send_argv
 from fleet_control.delegate import DELEGATION_ID_RE, delegate_worker, main as delegate_main
 from fleet_control.errors import ControlError, MESSAGES
 from fleet_control.journal import fresh_record, write_record
@@ -34,6 +34,7 @@ WORKER_SECRET = derive_nostr_private_key(bytes([2]) + bytes(31))
 OTHER_SECRET = derive_nostr_private_key(bytes([3]) + bytes(31))
 CONTROL_HEX = derive_nostr_public_key(CONTROL_SECRET).hex()
 WORKER_HEX = derive_nostr_public_key(WORKER_SECRET).hex()
+OTHER_HEX = derive_nostr_public_key(OTHER_SECRET).hex()
 CONTROL_NSEC = encode_nsec(CONTROL_SECRET)
 WORKER_NPUB = encode_npub(derive_nostr_public_key(WORKER_SECRET))
 CONTROL_NPUB = encode_npub(derive_nostr_public_key(CONTROL_SECRET))
@@ -262,7 +263,7 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(lines[0]["argv"][1:], ["dms", "open", "--pubkey", WORKER_HEX])
         self.assertEqual(
             lines[1]["argv"][1:],
-            ["messages", "send", "--channel", DM_ID, "--content", "-"],
+            ["messages", "send", "--channel", DM_ID, "--mention", WORKER_HEX, "--content", "-"],
         )
         self.assertEqual(lines[1]["stdin"], delegation_stdin(result["delegation_id"], TASK).decode())
         self.assertFalse(lines[0]["key_in_argv"])
@@ -279,6 +280,90 @@ class DelegateTests(unittest.TestCase):
         self.assertIn("shell=False", source)
         self.assertNotIn("shell=True", source)
         self.assertNotIn("os.system", (REPO / "fleet_control" / "delegate.py").read_text())
+
+    def test_send_addresses_only_the_fleet_resolved_worker(self):
+        """The message p-tag is the authorized worker key, never caller text."""
+        other_task = f"note --mention {OTHER_HEX}"
+        result = self.delegate(
+            {
+                "worker": "operator",
+                "task": other_task,
+                "delegation_id": "dlg_" + "44" * 16,
+            }
+        )
+        self.assertEqual(result["worker"], "operator")
+        sent = self.buzz.calls[1]
+        self.assertEqual(
+            sent["argv"],
+            [
+                "/usr/local/bin/buzz",
+                "messages",
+                "send",
+                "--channel",
+                DM_ID,
+                "--mention",
+                WORKER_HEX,
+                "--content",
+                "-",
+            ],
+        )
+        self.assertNotIn(OTHER_HEX, sent["argv"])
+        self.assertIn(OTHER_HEX, sent["stdin"].decode())
+        self.assertEqual(self.buzz.calls[0]["argv"][-1], WORKER_HEX)
+
+        steered = Buzz()
+        with self.assertRaises(ControlError) as caught:
+            self.delegate(
+                {
+                    "worker": "operator",
+                    "task": TASK,
+                    "mention": OTHER_HEX,
+                    "pubkey": OTHER_HEX,
+                    "channel": DM_ID,
+                },
+                buzz_runner=steered,
+            )
+        self.assertEqual(caught.exception.code, "invalid_request")
+        self.assertEqual(steered.calls, [])
+
+        alternate = public_worker(
+            observed={"buzz_public_key_hex": OTHER_HEX, "buzz_npub": OTHER_NPUB}
+        )
+        alternate_buzz = Buzz()
+        self.delegate(
+            {
+                "worker": "operator",
+                "task": "use the fleet identity",
+                "delegation_id": "dlg_" + "55" * 16,
+            },
+            transport=FleetHTTP(alternate),
+            buzz_runner=alternate_buzz,
+        )
+        self.assertEqual(
+            alternate_buzz.calls[0]["argv"],
+            ["/usr/local/bin/buzz", "dms", "open", "--pubkey", OTHER_HEX],
+        )
+        self.assertEqual(
+            alternate_buzz.calls[1]["argv"],
+            [
+                "/usr/local/bin/buzz",
+                "messages",
+                "send",
+                "--channel",
+                DM_ID,
+                "--mention",
+                OTHER_HEX,
+                "--content",
+                "-",
+            ],
+        )
+        self.assertNotIn(WORKER_HEX, alternate_buzz.calls[1]["argv"])
+        with self.assertRaises(ControlError) as caught:
+            send_argv("/usr/local/bin/buzz", DM_ID, OTHER_HEX.upper())
+        self.assertEqual(caught.exception.code, "helper_failed")
+        with self.assertRaises(ControlError) as caught:
+            send_argv("/usr/local/bin/buzz", "--channel", WORKER_HEX)
+        self.assertEqual(caught.exception.code, "helper_failed")
 
     def test_closed_failures_do_not_send(self):
         cases = {
@@ -487,10 +572,11 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "invalid_request")
         self.assertIsNone(caught.exception.delegation_id)
         self.assertNotIn("delegation_id", caught.exception.public_body())
-        for extra in ("pubkey", "relay", "platform", "profile"):
+        for extra in ("mention", "pubkey", "channel", "relay", "platform", "profile"):
             with self.assertRaises(ControlError) as caught:
-                self.delegate({"worker": "operator", "task": TASK, extra: "nope"})
+                self.delegate({"worker": "operator", "task": TASK, extra: OTHER_HEX})
             self.assertEqual(caught.exception.code, "invalid_request")
+            self.assertEqual(self.buzz.calls, [])
         with self.assertRaises(ControlError) as caught:
             self.delegate({"worker": "operator", "task": "   "})
         self.assertEqual(caught.exception.code, "invalid_task")
@@ -565,8 +651,19 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(opened["stdin"], b"")
         self.assertEqual(
             sent["argv"],
-            ["/usr/local/bin/buzz", "messages", "send", "--channel", DM_ID, "--content", "-"],
+            [
+                "/usr/local/bin/buzz",
+                "messages",
+                "send",
+                "--channel",
+                DM_ID,
+                "--mention",
+                WORKER_HEX,
+                "--content",
+                "-",
+            ],
         )
+        self.assertEqual(sent["argv"].count("--mention"), 1)
         self.assertTrue(sent["stdin"].decode().startswith(f"[fleet-delegation {delegation_id}]\n"))
         self.assertNotIn(TASK, sent["argv"])
         self.assertNotIn("SECRET_PARENT", opened["env"])
@@ -726,6 +823,19 @@ class McpSourceTests(unittest.TestCase):
         self.assertNotIn("BUZZ_PRIVATE_KEY=", text)
         self.assertNotIn("shell: true", text)
         self.assertIn("shell: false", text)
+        schema = text.split('server.registerTool(\n  "delegate_worker",', 1)[1].split(
+            "async ({ worker, task, delegation_id }) => {", 1
+        )[0]
+        self.assertNotIn("mention", schema)
+        self.assertNotIn("pubkey", schema)
+        self.assertNotIn("channel", schema)
+        handler = text.split("async ({ worker, task, delegation_id }) => {", 1)[1].split(
+            "return textResult", 1
+        )[0]
+        self.assertIn("const payload = { worker, task };", handler)
+        self.assertIn("payload.delegation_id = delegation_id;", handler)
+        self.assertNotIn("mention", handler)
+        self.assertNotIn("--mention", text)
         proc = subprocess.run(
             ["node", "--check", str(REPO / "fleet-mcp" / "index.js")],
             capture_output=True,
