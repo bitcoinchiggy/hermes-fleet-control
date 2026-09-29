@@ -13,6 +13,14 @@ read worker status, ensure one worker, and delegate a task over Buzz.
 `delivery` is `relay_accepted`. That is not worker execution and not
 task completion. A later worker reply is a separate Buzz turn.
 
+When Control reports that status to the human, it uses the worker's
+plain name (`operator`), not `@operator`, unless that worker is a
+member of the current Buzz conversation and the mention is intentional.
+A human `@mention` that only identified the worker is input syntax and
+is not echoed into a different conversation. The rule is
+`skills/fleet-delegation/SKILL.md`, and the `delegate_worker` tool
+description repeats it.
+
 ## Trust boundary
 
 Hermes Control talks to workers through Buzz. Control signs its own

@@ -823,12 +823,19 @@ class McpSourceTests(unittest.TestCase):
         self.assertNotIn("BUZZ_PRIVATE_KEY=", text)
         self.assertNotIn("shell: true", text)
         self.assertIn("shell: false", text)
-        schema = text.split('server.registerTool(\n  "delegate_worker",', 1)[1].split(
-            "async ({ worker, task, delegation_id }) => {", 1
-        )[0]
-        self.assertNotIn("mention", schema)
-        self.assertNotIn("pubkey", schema)
-        self.assertNotIn("channel", schema)
+        input_schema = text.split('server.registerTool(\n  "delegate_worker",', 1)[1].split(
+            "inputSchema:", 1
+        )[1].split("async ({ worker, task, delegation_id }) => {", 1)[0]
+        self.assertNotIn("mention", input_schema)
+        self.assertNotIn("pubkey", input_schema)
+        self.assertNotIn("channel", input_schema)
+        self._assert_reporting_rule(description)
+        skill = (REPO / "skills" / "fleet-delegation" / "SKILL.md").read_text()
+        self._assert_reporting_rule(skill)
+        self.assertIn("name: fleet-delegation", skill)
+        readme = (REPO / "README.md").read_text()
+        self.assertIn("skills/fleet-delegation/SKILL.md", readme)
+        self.assertIn("plain name (`operator`), not `@operator`", readme)
         handler = text.split("async ({ worker, task, delegation_id }) => {", 1)[1].split(
             "return textResult", 1
         )[0]
@@ -843,6 +850,24 @@ class McpSourceTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _assert_reporting_rule(self, text: str) -> None:
+        """The status-reply rule is the same in the skill and the tool description."""
+        required = (
+            "delegate_worker remains the preferred structured primitive for assigning work to Fleet workers.",
+            "Do not weaken Buzz mention validation.",
+            "Do not add a generic message-sending tool.",
+            "Do not add the worker to the current conversation just so a status @mention will pass.",
+            "Control retains its other authorized tools for diagnosis, recovery, and general communication.",
+            "When reporting delegation or status back to the human, refer to the Fleet worker by plain name, for example operator, not @operator, unless that worker is actually a member of the current Buzz conversation and an intentional mention is required.",
+            "An @mention used by the human to identify a worker is input syntax and must not automatically be echoed as an @mention into a different Buzz conversation.",
+            "Write: Delegated to operator — relay accepted.",
+            "Do not write: Delegated to @operator — relay accepted.",
+        )
+        for sentence in required:
+            self.assertIn(sentence, text)
+        self.assertNotIn("send_message", text)
+        self.assertNotIn("--mention", text)
 
 
 if __name__ == "__main__":
