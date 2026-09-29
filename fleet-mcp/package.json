@@ -1,0 +1,10 @@
+{
+  "name": "hermes-fleet-control-mcp",
+  "private": true,
+  "type": "module",
+  "description": "Hermes Control Fleet MCP server. worker_status, ensure_worker, and delegate_worker.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.25.76"
+  }
+}
