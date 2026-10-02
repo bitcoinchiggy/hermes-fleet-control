@@ -23,8 +23,9 @@ cannot set it, and it is not written into the worker message.
 `fleet-delegation-intake` is what the patched gateway runs on an inbound
 reply when `HERMES_FLEET_CONTROL_INTEGRATION=1`. A reply is handed off
 when the human adapter accepts the turn, pending delivery when the
-Hermes delivery ledger holds a report the send did not finish, and
-delivered when that send succeeds. Journal `completed` means the model
+Hermes delivery ledger holds this handoff's own report the send did not
+finish, and delivered when that send succeeds. Another turn's success
+does not complete this handoff. Journal `completed` means the model
 is not run again. It does not by itself prove the human has the
 message. If handoff stops before a report exists, the reply stays
 pending for fleet recovery. Gateway startup runs that recovery, then a
