@@ -8,6 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fleet_control.runtime import reexec_managed_python
+
+reexec_managed_python()
+
 from fleet_control.ensure import main
 
 if __name__ == "__main__":

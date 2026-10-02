@@ -22,6 +22,7 @@ AUTH_TAG_KEY = "BUZZ_AUTH_TAG"
 PROFILE_KEY = "FLEET_CONTROL_HERMES_PROFILE"
 PROFILES_ROOT_KEY = "FLEET_CONTROL_PROFILES_ROOT"
 _SAFE_LOCALE = re.compile(r"^[A-Za-z0-9._@+-]+$")
+# Buzz child only. This does not select the helper interpreter.
 _CHILD_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 

@@ -95,7 +95,11 @@ class FleetStatusTests(unittest.TestCase):
         self.assertEqual(json.loads("".join(code_out))["error"]["code"], "invalid_name")
 
     def test_script_boots_and_refuses_a_missing_env_file(self):
-        env = {"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": "/tmp"}
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin"),
+            "HOME": "/tmp",
+            "FLEET_CONTROL_PYTHON": sys.executable,
+        }
         proc = subprocess.run(
             [sys.executable, str(REPO / "fleet-status")],
             env=env,
@@ -117,7 +121,11 @@ class FleetEnsureTests(unittest.TestCase):
         self.assertEqual((method, url, payload), ("PUT", "https://fleet.example/v1/workers/operator/ensure", b"{}"))
 
     def test_script_boots(self):
-        env = {"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": "/tmp"}
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin"),
+            "HOME": "/tmp",
+            "FLEET_CONTROL_PYTHON": sys.executable,
+        }
         proc = subprocess.run(
             [sys.executable, str(REPO / "fleet-ensure"), "operator"],
             env=env,
