@@ -23,9 +23,13 @@ cannot set it, and it is not written into the worker message.
 `fleet-delegation-intake` is what the patched gateway runs on an inbound
 reply when `HERMES_FLEET_CONTROL_INTEGRATION=1`. A completed reply does
 not wake Control again. If handoff stops before the human adapter
-accepts the turn, the reply stays pending for recovery. An unavailable
-intake holds reply-parent messages instead of dispatching them; a
-positive unrelated answer still uses the normal path. Unpatched Hermes
+accepts the turn, the reply stays pending for recovery. Gateway startup
+runs that recovery, then a bounded background retry until shutdown. An
+unavailable intake holds reply-parent messages in the profile journal
+directory (`/home/hermes/.hermes/profiles/<profile>/fleet-delegations/unavailable-holds`,
+or `FLEET_DELEGATION_JOURNAL_DIR` when that absolute override is set),
+not in the hermes-fleet-control checkout. A positive unrelated answer
+still uses the normal path. Unpatched Hermes
 `7817bf522af3caf54b30ae59f16157469d7638fc` does not call it, so that
 gateway still delivers its reply into the worker DM. The reviewable
 patch and the reapply check live in hermes-fleet at
