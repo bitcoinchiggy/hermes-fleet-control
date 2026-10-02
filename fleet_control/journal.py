@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import stat
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -21,7 +22,7 @@ from typing import Any, Iterator, Mapping
 from fleet_control.support.profile_env import HERMES_PROFILES_DIR, validate_profile_name
 from fleet_control.support.redact import dump_safe_json, utc_rfc3339
 
-from fleet_control.errors import fail
+from fleet_control.errors import ControlError, fail
 
 JOURNAL_DIR_KEY = "FLEET_DELEGATION_JOURNAL_DIR"
 PROFILE_ENV = "FLEET_CONTROL_HERMES_PROFILE"
@@ -56,10 +57,18 @@ _ROUTED = _CURRENT + (
     "origin_scope_id",
     "origin_user_id",
 )
+_DELIVERY_STATES = frozenset({"pending", "inflight", "completed"})
+_DELIVERY_ITEM_KEYS = frozenset({"event_id", "state", "claim_id", "owner", "pid"})
 _LEGACY_KEYS = tuple(sorted(_LEGACY))
 _CURRENT_KEYS = tuple(sorted(_CURRENT))
 _ROUTED_KEYS = tuple(sorted(_ROUTED))
+_TRACKED_CURRENT_KEYS = tuple(sorted(_CURRENT + ("reply_deliveries",)))
+_TRACKED_ROUTED_KEYS = tuple(sorted(_ROUTED + ("reply_deliveries",)))
+_READABLE_KEYS = frozenset(
+    {_LEGACY_KEYS, _CURRENT_KEYS, _ROUTED_KEYS, _TRACKED_CURRENT_KEYS, _TRACKED_ROUTED_KEYS}
+)
 _CHAT_TYPES = frozenset({"dm", "group", "channel", "thread"})
+_CLAIM_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def ensure_journal_dir(path: Path) -> Path:
@@ -108,6 +117,23 @@ def exclusive_delegation(directory: Path, delegation_id: str) -> Iterator[None]:
             os.close(fd)
 
 
+@contextmanager
+def exclusive_delegation_wait(directory: Path, delegation_id: str, timeout: float = 5.0) -> Iterator[None]:
+    """Serialize reply claims. A busy lock is retried until ``timeout``."""
+    deadline = time.monotonic() + timeout
+    while True:
+        entered = False
+        try:
+            with exclusive_delegation(directory, delegation_id):
+                entered = True
+                yield
+            return
+        except ControlError as exc:
+            if entered or exc.code != "delegation_in_flight" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005)
+
+
 def read_record(directory: Path, delegation_id: str) -> dict[str, Any] | None:
     path = directory / f"{delegation_id}.json"
     if path.is_symlink():
@@ -128,15 +154,17 @@ def read_record(directory: Path, delegation_id: str) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         raise fail("journal_unusable")
     keys = tuple(sorted(parsed))
-    if keys not in (_LEGACY_KEYS, _CURRENT_KEYS, _ROUTED_KEYS):
+    if keys not in _READABLE_KEYS:
         raise fail("journal_unusable")
     if parsed.get("delegation_id") != delegation_id or parsed.get("state") not in STATES:
         raise fail("journal_unusable")
     _validate_identity(parsed)
-    if keys in (_CURRENT_KEYS, _ROUTED_KEYS):
+    if keys in (_CURRENT_KEYS, _ROUTED_KEYS, _TRACKED_CURRENT_KEYS, _TRACKED_ROUTED_KEYS):
         _validate_current(parsed)
-    if keys == _ROUTED_KEYS:
+    if keys in (_ROUTED_KEYS, _TRACKED_ROUTED_KEYS):
         _validate_routed(parsed)
+    if keys in (_TRACKED_CURRENT_KEYS, _TRACKED_ROUTED_KEYS):
+        _validate_deliveries(parsed)
     return parsed
 
 
@@ -312,6 +340,129 @@ def _validate_current(parsed: Mapping[str, Any]) -> None:
         or any(not isinstance(item, str) or not _HEX64_RE.fullmatch(item) for item in replies)
     ):
         raise fail("journal_unusable")
+
+
+def _validate_deliveries(parsed: Mapping[str, Any]) -> None:
+    deliveries = parsed.get("reply_deliveries")
+    replies = parsed.get("reply_event_ids")
+    if not isinstance(deliveries, list) or len(deliveries) > MAX_REPLY_EVENTS:
+        raise fail("journal_unusable")
+    seen: set[str] = set()
+    for item in deliveries:
+        if not isinstance(item, dict) or set(item) != _DELIVERY_ITEM_KEYS:
+            raise fail("journal_unusable")
+        event_id = item.get("event_id")
+        state = item.get("state")
+        claim_id = item.get("claim_id")
+        owner = item.get("owner")
+        pid = item.get("pid")
+        if (
+            not isinstance(event_id, str)
+            or not _HEX64_RE.fullmatch(event_id)
+            or event_id in seen
+            or not isinstance(replies, list)
+            or event_id not in replies
+            or state not in _DELIVERY_STATES
+            or not isinstance(claim_id, str)
+            or not _CLAIM_RE.fullmatch(claim_id)
+            or not isinstance(owner, str)
+            or (owner and not _CLAIM_RE.fullmatch(owner))
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid < 0
+            or pid >= 2**31
+        ):
+            raise fail("journal_unusable")
+        if state == "inflight":
+            if not owner or pid <= 0:
+                raise fail("journal_unusable")
+        elif owner or pid:
+            raise fail("journal_unusable")
+        seen.add(event_id)
+
+
+def reply_hold_dir(directory: Path) -> Path:
+    """Private directory for one inflight reply body. Not a delegation record."""
+    path = directory / "reply-holds"
+    if path.is_symlink():
+        raise fail("journal_unusable")
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        raise fail("journal_unusable") from None
+    os.chmod(path, 0o700)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+        raise fail("journal_unusable")
+    return path
+
+
+def write_reply_hold(directory: Path, delegation_id: str, event_id: str, payload: Mapping[str, Any]) -> None:
+    """Atomically store the worker text needed to retry one unfinished reply."""
+    folder = reply_hold_dir(directory)
+    try:
+        body = (dump_safe_json(dict(payload)) + "\n").encode("utf-8")
+    except Exception:
+        raise fail("journal_unusable") from None
+    if len(body) > 65536 or b"BUZZ_PRIVATE_KEY" in body or b"nsec1" in body.lower():
+        raise fail("journal_unusable")
+    final = folder / f"{delegation_id}.{event_id}.json"
+    if final.is_symlink():
+        raise fail("journal_unusable")
+    tmp = folder / f".{delegation_id}.{event_id}.{secrets.token_hex(4)}.tmp"
+    fd: int | None = None
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchmod(fd, 0o600)
+        view = body
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise fail("journal_unusable")
+            view = view[written:]
+        os.fsync(fd)
+    except OSError:
+        raise fail("journal_unusable") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, final)
+    os.chmod(final, 0o600)
+
+
+def read_reply_hold(directory: Path, delegation_id: str, event_id: str) -> dict[str, Any] | None:
+    path = reply_hold_dir(directory) / f"{delegation_id}.{event_id}.json"
+    if path.is_symlink():
+        raise fail("journal_unusable")
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise fail("journal_unusable") from None
+    if len(raw) > 65536:
+        raise fail("journal_unusable")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+        dump_safe_json(parsed)
+    except Exception:
+        raise fail("journal_unusable") from None
+    if not isinstance(parsed, dict):
+        raise fail("journal_unusable")
+    return parsed
+
+
+def delete_reply_hold(directory: Path, delegation_id: str, event_id: str) -> None:
+    path = directory / "reply-holds" / f"{delegation_id}.{event_id}.json"
+    if path.is_symlink():
+        raise fail("journal_unusable")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise fail("journal_unusable") from None
 
 
 def _validate_routed(parsed: Mapping[str, Any]) -> None:

@@ -15,7 +15,7 @@ read a route out of the reply text.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping
 
 from fleet_control.origin import ReplyOrigin, parse_origin, targets_worker_dm
@@ -29,6 +29,11 @@ REASON_NOT_ACCEPTED = "delegation_not_accepted"
 REASON_RECORD_UNUSABLE = "record_unusable"
 REASON_REPLY_UNSAFE = "reply_unsafe"
 REASON_SENDER_MISMATCH = "sender_mismatch"
+REASON_REPLY_COMPLETED = "reply_completed"
+REASON_REPLY_IN_FLIGHT = "reply_in_flight"
+DELIVERY_WAKE = "wake"
+DELIVERY_COMPLETED = "completed"
+DELIVERY_IN_FLIGHT = "in_flight"
 
 _DELEGATION_ID_RE = re.compile(r"^dlg_[0-9a-f]{32}$")
 _HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -55,6 +60,9 @@ class DelegationReplyPlan:
     wake_text: str | None
     suppress_worker_delivery: bool | None
     suppress_worker_error: bool | None
+    claim_id: str | None = None
+    delivery: str | None = None
+    inbound_event_id: str | None = None
 
     def public_body(self) -> dict[str, object]:
         """JSON the gateway can apply. Secret-shaped replies never reach it."""
@@ -81,7 +89,29 @@ class DelegationReplyPlan:
             "wake_text": self.wake_text,
             "suppress_worker_delivery": self.suppress_worker_delivery,
             "suppress_worker_error": self.suppress_worker_error,
+            "claim_id": self.claim_id,
+            "delivery": self.delivery,
+            "inbound_event_id": self.inbound_event_id,
         }
+
+
+def without_wake(
+    plan: DelegationReplyPlan,
+    *,
+    reason: str,
+    delivery: str,
+    claim_id: str | None,
+    inbound_event_id: str | None = None,
+) -> DelegationReplyPlan:
+    """A correlated reply that must not start another human turn."""
+    return replace(
+        plan,
+        wake_text=None,
+        reason=reason,
+        delivery=delivery,
+        claim_id=claim_id,
+        inbound_event_id=inbound_event_id,
+    )
 
 
 def plan_delegation_reply(
@@ -196,6 +226,8 @@ def _untouched() -> DelegationReplyPlan:
         wake_text=None,
         suppress_worker_delivery=None,
         suppress_worker_error=None,
+        claim_id=None,
+        delivery=None,
     )
 
 
@@ -219,6 +251,8 @@ def _correlated(
         wake_text=wake_text,
         suppress_worker_delivery=True,
         suppress_worker_error=True,
+        claim_id=None,
+        delivery=None,
     )
 
 
