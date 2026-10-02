@@ -26,7 +26,11 @@ description repeats it.
 Hermes Control talks to workers through Buzz. Control signs its own
 messages. The provisioner does not sign for Control. Worker private
 keys are not read here. This package does not derive keys from a seed
-or an extended private key, and it does not write profile files.
+or an extended private key. The delegation tools do not write profile
+files. `fleet-allow-inbound` is a separate operator command, not an MCP
+tool. It rewrites only `BUZZ_ALLOWED_USERS` on the one profile bound to
+the active gateway, keeps every human key already there, and preserves
+`BUZZ_PRIVATE_KEY`.
 
 There is no generic `send_message` tool. The model may pass a worker
 name, a task, and an optional delegation id. It cannot choose a
@@ -52,16 +56,25 @@ installer is standard library only. It does not install into the
 python3 install-control-runtime --python /usr/bin/python3.12
 ```
 
-The MCP server execs `runtime/venv/bin/python` and passes the helper
-script as an argument. A missing interpreter is `helper_failed`, not a
-`PATH` search. Both upgrade breaks, and the inbound allowlist that
-this repository does not apply, are recorded in
-[docs/upgrade-breaks.md](docs/upgrade-breaks.md).
+That installs the hashed `requirements.lock` (`cryptography==50.0.2`,
+`cffi==2.1.1`, `pycparser==3.0`) with `--require-hashes` and
+`--only-binary=:all:`. The MCP server execs `runtime/venv/bin/python`
+and passes the helper script as an argument. A missing interpreter is
+`helper_failed`, not a `PATH` search. A direct helper re-execs that
+same interpreter. Membership is `sys.prefix`, because `realpath` of
+`bin/python` is often the system binary.
+
+`fleet-allow-inbound` reads the active profile and adds verified
+operator and researcher public keys without dropping extra existing
+human keys. It is the Control apply command. Both upgrade breaks are
+recorded in [docs/upgrade-breaks.md](docs/upgrade-breaks.md).
 
 ## Layout
 
-`fleet-status`, `fleet-ensure`, and `fleet-delegate` are the CLI
-helpers. Each inserts this checkout on `sys.path` and nothing else.
+`fleet-status`, `fleet-ensure`, `fleet-delegate`, and
+`fleet-allow-inbound` are the CLI helpers. Each inserts this checkout
+on `sys.path` and nothing else. `fleet-allow-inbound` is not registered
+as an MCP tool.
 `fleet-mcp/` is the stdio MCP server. `fleet_control/` is the Python
 package. `fleet_control/support/` is the local name, env, profile-read,
 redaction, and NIP-19 code those helpers need.

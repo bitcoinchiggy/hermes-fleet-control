@@ -33,9 +33,12 @@ python3 install-control-runtime --python /usr/bin/python3.12
 `install-control-runtime` is standard library only, so the `python3` on
 `PATH` may start it. `--python` is required. It is the absolute
 interpreter that runs `python -m venv runtime/venv` and then
-`runtime/venv/bin/python -m pip install --require-virtualenv -r requirements.txt`.
-The command that worked in the failure was `/usr/bin/python3.12`.
-Confirm that binary on the host before using it. Do not point this at
+`runtime/venv/bin/python -m pip install --require-virtualenv --require-hashes --only-binary=:all: -r requirements.lock`.
+The lock pins `cryptography==50.0.2` and the transitive pins
+`cffi==2.1.1` and `pycparser==3.0`, each with reviewed wheel hashes.
+`requirements.txt` only records the direct pin. The command that worked
+in the failure was `/usr/bin/python3.12`. Confirm that binary on the
+host before using it. Do not point this at
 `/home/hermes/.hermes/hermes-agent/venv`.
 
 `fleet-mcp/index.js` execs `runtime/venv/bin/python` and passes
@@ -47,8 +50,12 @@ when it is an absolute interpreter outside the agent virtualenv.
 
 A direct `./fleet-delegate` still starts through the shebang, then
 re-execs the same managed interpreter before importing `cryptography`.
-That re-exec is a backstop. The supported Hermes entry is the MCP
-launcher.
+Membership is `sys.prefix` (and `pyvenv.cfg` in that prefix), not
+`realpath` of the interpreter. A virtualenv `bin/python` is often a
+symlink to the system binary, so equal realpaths do not mean this
+process is inside the virtualenv. A path that is not a virtualenv fails
+closed instead of being executed. That re-exec is a backstop. The
+supported Hermes entry is the MCP launcher.
 
 ## 2. Operator reply was unauthorized on Control's gateway
 
@@ -65,13 +72,39 @@ public keys in that profile's `BUZZ_ALLOWED_USERS`. The worker's public
 key was not among them.
 
 Pairing, `allow_all_users`, and polling are not the authorization
-model. The durable change is the planner in
-`bitcoinchiggy/hermes-fleet`: keep the human keys, append the public
-`buzz_public_key_hex` values for `operator` and `researcher`, leave
-`allow_all_users` false, and apply that payload with
-`hermes-buzz-runtime-apply` on the single active
-`hermes-gateway-<profile>.service`. This repository does not contain
-that planner and does not write allowlists.
+model. `fleet.yaml` does not govern Control. Replacing the profile list
+with the fleet.yaml humans would drop extra existing human keys.
+hermes-fleet only checks that fleet policy is not `allow_all_users` and
+names the apply command. It does not emit a replacement allowlist.
+
+The supported apply command is Control-local `fleet-allow-inbound`. It
+is not an MCP tool. It reads the active profile, keeps every current
+public key in order (extra existing human keys are preserved), and
+appends `operator` then `researcher` when `buzz_npub` decodes to
+`buzz_public_key_hex`. `allow_all_users` stays false. `BUZZ_PRIVATE_KEY`
+is preserved and is not printed. A second run with the same keys does
+not change the file. The command does not import a worker
+key-derivation package, does not read worker private keys, does not
+accept provisioner administration credentials, and does not use a guest
+agent.
+
+Reviewed steps, not performed by this change:
+
+1. `python3 install-control-runtime --python /usr/bin/python3.12` after
+   confirming that binary.
+2. Capture
+   `systemctl list-units 'hermes-gateway-*.service' --state=active --plain --no-legend`.
+   Exactly one `hermes-gateway-<profile>.service` must be active. Do
+   not assume the name. Set `FLEET_CONTROL_HERMES_PROFILE` to it.
+3. GET `/v1/workers/operator` and GET `/v1/workers/researcher`. Pass
+   those public documents, and the captured unit name, on stdin.
+4. Run `fleet-allow-inbound`. It writes only that profile's `.env`.
+5. Restart only that gateway unit when the result says `changed` is
+   true. Run the command again and require `changed` false.
+
+Stop if more than one profile gateway is active, if `allow_all_users`
+is not false, if a worker `npub` does not match its public hex, or if
+a previously authorized human key disappears.
 
 The profile name `control` in this repository's tests is a fixture. It
 is not evidence of the live gateway profile. Zero or several

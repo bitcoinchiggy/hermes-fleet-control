@@ -1,13 +1,15 @@
-"""Read-only, pinned-FD access to a named Hermes profile ``.env``.
+"""Pinned-FD access to a named Hermes profile ``.env``.
 
 ``destination`` is a profile name, not a filesystem path. After the
-profile directory is opened, ``read_env`` uses that directory FD and
-``O_NOFOLLOW``. This module does not write profile files.
+profile directory is opened, reads and the allowlist replace use that
+directory FD and ``O_NOFOLLOW``. Delegation reads. Only the inbound
+allowlist command replaces the file, and it must keep ``BUZZ_PRIVATE_KEY``.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 from pathlib import Path
 
@@ -19,9 +21,13 @@ HERMES_PROFILES_DIR = "/home/hermes/.hermes/profiles"
 ERR_INVALID_DESTINATION = "invalid destination"
 ERR_PROFILE_NOT_FOUND = "profile not found"
 ERR_UNSAFE_ENV_TARGET = "unsafe env target"
+ERR_SECRET_WRITE_FAILED = "secret write failed"
 
 ENV_FILENAME = ".env"
 MAX_ENV_BYTES = 1024 * 1024
+_TMP_PREFIX = ".hf-env-"
+_TMP_SUFFIX = ".tmp"
+_TMP_ATTEMPTS = 16
 
 
 class ProfileEnvError(ValueError):
@@ -70,6 +76,13 @@ class OpenedHermesProfile:
         """Return ``.env`` bytes. Caller must not log or print them."""
         self._require_open()
         return _read_existing_env(self._profile_fd)
+
+    def replace_env(self, new_bytes: bytes) -> None:
+        """Replace ``.env`` via a same-directory temp file and ``os.replace``."""
+        self._require_open()
+        if not isinstance(new_bytes, (bytes, bytearray)):
+            raise ProfileEnvError(ERR_SECRET_WRITE_FAILED)
+        _atomic_replace_env(self._profile_fd, bytes(new_bytes))
 
     def close(self) -> None:
         if self._closed:
@@ -230,6 +243,99 @@ def _read_existing_env(profile_fd: int) -> bytes:
     if not utf8_ok:
         raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
     return data
+
+
+def _create_exclusive_temp(profile_fd: int) -> tuple[int, str]:
+    flags = _open_flags(os.O_WRONLY, os.O_CREAT, os.O_EXCL)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for _ in range(_TMP_ATTEMPTS):
+        name = f"{_TMP_PREFIX}{secrets.token_hex(8)}{_TMP_SUFFIX}"
+        fd: int | None = None
+        exists = False
+        failed = False
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=profile_fd)
+        except FileExistsError:
+            exists = True
+        except OSError:
+            failed = True
+        if exists:
+            continue
+        if failed or fd is None:
+            break
+        chmod_failed = False
+        try:
+            os.fchmod(fd, 0o600)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600:
+                chmod_failed = True
+        except OSError:
+            chmod_failed = True
+        if chmod_failed:
+            _close_fd(fd)
+            _unlink_in_dir(profile_fd, name)
+            break
+        return fd, name
+    raise ProfileEnvError(ERR_SECRET_WRITE_FAILED)
+
+
+def _refuse_env_entry_if_present_unsafe(profile_fd: int) -> None:
+    missing = False
+    unsafe = False
+    st = None
+    try:
+        st = os.lstat(ENV_FILENAME, dir_fd=profile_fd)
+    except FileNotFoundError:
+        missing = True
+    except OSError:
+        unsafe = True
+    if missing:
+        return
+    if unsafe or st is None:
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+
+
+def _atomic_replace_env(profile_fd: int, new_bytes: bytes) -> None:
+    tmp_fd: int | None = None
+    tmp_name: str | None = None
+    write_error = False
+    replaced = False
+    try:
+        tmp_fd, tmp_name = _create_exclusive_temp(profile_fd)
+        view = memoryview(new_bytes)
+        written = 0
+        while written < len(new_bytes):
+            count = os.write(tmp_fd, view[written:])
+            if count <= 0:
+                raise OSError("short write")
+            written += count
+        os.fsync(tmp_fd)
+        os.close(tmp_fd)
+        tmp_fd = None
+        _refuse_env_entry_if_present_unsafe(profile_fd)
+        os.replace(tmp_name, ENV_FILENAME, src_dir_fd=profile_fd, dst_dir_fd=profile_fd)
+        replaced = True
+        tmp_name = None
+    except ProfileEnvError:
+        raise
+    except Exception:
+        write_error = True
+    finally:
+        _close_fd(tmp_fd)
+        if tmp_name is not None and not replaced:
+            _unlink_in_dir(profile_fd, tmp_name)
+    if write_error:
+        raise ProfileEnvError(ERR_SECRET_WRITE_FAILED)
+
+
+def _unlink_in_dir(dir_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except OSError:
+        pass
 
 
 def _close_fd(fd: int | None) -> None:
