@@ -21,10 +21,14 @@ that record. It is not a task viewer. The origin is copied from Hermes
 MCP `_meta["hermes.fleet.origin"]` for that one call. The model payload
 cannot set it, and it is not written into the worker message.
 `fleet-delegation-intake` is what the patched gateway runs on an inbound
-reply when `HERMES_FLEET_CONTROL_INTEGRATION=1`. A completed reply does
-not wake Control again. If handoff stops before the human adapter
-accepts the turn, the reply stays pending for recovery. Gateway startup
-runs that recovery, then a bounded background retry until shutdown. An
+reply when `HERMES_FLEET_CONTROL_INTEGRATION=1`. A reply is handed off
+when the human adapter accepts the turn, pending delivery when the
+Hermes delivery ledger holds a report the send did not finish, and
+delivered when that send succeeds. Journal `completed` means the model
+is not run again. It does not by itself prove the human has the
+message. If handoff stops before a report exists, the reply stays
+pending for fleet recovery. Gateway startup runs that recovery, then a
+bounded background retry until shutdown. An
 unavailable intake holds reply-parent messages in the profile journal
 directory (`/home/hermes/.hermes/profiles/<profile>/fleet-delegations/unavailable-holds`,
 or `FLEET_DELEGATION_JOURNAL_DIR` when that absolute override is set),
