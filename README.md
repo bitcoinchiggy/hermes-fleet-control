@@ -21,7 +21,11 @@ that record. It is not a task viewer. The origin is copied from Hermes
 MCP `_meta["hermes.fleet.origin"]` for that one call. The model payload
 cannot set it, and it is not written into the worker message.
 `fleet-delegation-intake` is what the patched gateway runs on an inbound
-reply when `HERMES_FLEET_CONTROL_INTEGRATION=1`. Unpatched Hermes
+reply when `HERMES_FLEET_CONTROL_INTEGRATION=1`. A completed reply does
+not wake Control again. If handoff stops before the human adapter
+accepts the turn, the reply stays pending for recovery. An unavailable
+intake holds reply-parent messages instead of dispatching them; a
+positive unrelated answer still uses the normal path. Unpatched Hermes
 `7817bf522af3caf54b30ae59f16157469d7638fc` does not call it, so that
 gateway still delivers its reply into the worker DM. The reviewable
 patch and the reapply check live in hermes-fleet at

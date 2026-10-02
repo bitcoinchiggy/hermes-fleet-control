@@ -47,11 +47,28 @@ does not contain the human platform, chat id, or session key.
 worker key. A match suppresses worker delivery and worker error
 notices. When the stored origin is usable, `wake_text` contains the
 original task and the worker result, and `report_to` is that human
-conversation. A mismatched sender or a record with no origin suppresses
-the worker turn and does not guess a destination. A different
-`reply_to` stays on the normal gateway path. A further instruction is a
-new `delegate_worker` call, which sends a new top-level DM with no
+conversation. The first successful claim records `reply_deliveries` as
+`inflight`. After the origin adapter accepts the turn, the gateway
+marks that reply `completed`. A later intake of the same event returns
+`delivery: completed` and no `wake_text`. A second concurrent intake
+sees the live claim and returns `delivery: in_flight`, also with no
+wake. A mismatched sender or a record with no origin suppresses the
+worker turn and does not guess a destination. A different `reply_to`
+stays on the normal gateway path. A further instruction is a new
+`delegate_worker` call, which sends a new top-level DM with no
 `--reply-to`.
+
+If the human adapter is missing, or resume fails before the adapter
+accepts the turn, the claim is released to `pending` and the worker
+text stays in `reply-holds/` under the journal directory. Recovery
+claims that pending reply again. An `inflight` claim whose pid is no
+longer running is recovered the same way. A live pid is not stolen.
+Completion is recorded only after the adapter's session task finishes.
+A crash after that task sends and before the completion write can
+produce a second human report; that window is at-least-once. A
+completed reply is not woken again. The worker DM is not used as the
+retry path, so an interrupted handoff is not silently replaced by a
+model turn in the worker conversation.
 
 ## Hermes patch
 
@@ -82,11 +99,20 @@ notice. `report_to` resumes the stored session on that platform's
 adapter, including the topic. `handle_message` derives the session key
 and delivers the final text with that adapter's `send`.
 
-A helper failure (missing binary, timeout, non-zero exit, or unusable
-output) returns the event to the normal Buzz path. It does not drop
-unrelated messages and it does not invent an error send into the worker
-DM. Suppression requires a successful intake decision.
-`kind` `not_delegation_reply` keeps the existing dispatch.
+Intake has two successful answers. `kind` `not_delegation_reply` is a
+positive decision that the parent is not a stored delegation, and that
+message keeps the existing dispatch. `kind` `delegation_reply` suppresses
+the worker DM. A helper failure is neither of those answers. A missing
+binary, timeout, non-zero exit, or unusable output means the correlation
+service is unavailable. Reply-parent messages on this integration are
+held in `unavailable-holds/` and are not dispatched, reacted to, or
+given a worker error. Top-level messages, and every gateway that does
+not set `HERMES_FLEET_CONTROL_INTEGRATION=1`, keep their normal path.
+When intake is available again, a held reply is classified: a positive
+unrelated reply is dispatched then, and a correlated reply resumes the
+human session once. If the hold file cannot be written, the message is
+still not dispatched in this process; recovery then depends on the
+relay presenting that event again. Holds are capped at 64 files.
 
 The patch adds `gateway/fleet_delegation.py` and two anchored call
 sites, marked `FLEET_DELEGATION_META` and `FLEET_DELEGATION_HANDOFF`.

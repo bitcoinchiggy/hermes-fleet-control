@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -19,7 +20,12 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fleet_control.delegation_inspect import show_delegation
-from fleet_control.delegation_intake import evaluate_inbound_reply
+from fleet_control.delegation_intake import (
+    complete_reply_delivery,
+    evaluate_inbound_reply,
+    recover_unfinished_replies,
+    release_reply_claim,
+)
 from fleet_control.delegate import delegate_worker
 from fleet_control.errors import ControlError
 from fleet_control.journal import fresh_record, read_record, update_record, write_record
@@ -87,6 +93,7 @@ class RoundtripTests(unittest.TestCase):
         self.assertNotIn("telegram", stdin)
 
         resumed = self._resume_after_restart(receipt["event_id"], RESULT, INBOUND_EVENT)
+        self.assertEqual(resumed["delivery"], "wake")
         self.assertEqual(resumed["chat_id"], ORIGIN_CHAT)
         self.assertEqual(resumed["session_key"], ORIGIN_SESSION)
         self.assertIs(resumed["suppress_worker_delivery"], True)
@@ -95,10 +102,14 @@ class RoundtripTests(unittest.TestCase):
         self.assertIn(TASK, resumed["wake"])
         self.assertIn(RESULT, resumed["wake"])
         self.assertNotIn(ORIGIN_CHAT, resumed["wake"])
+        self.assertTrue(
+            complete_reply_delivery(self.journal, receipt["delegation_id"], INBOUND_EVENT, resumed["claim_id"])
+        )
 
         stored = read_record(self.journal, receipt["delegation_id"])
         assert stored is not None
         self.assertEqual(stored["reply_event_ids"], [INBOUND_EVENT])
+        self.assertEqual(stored["reply_deliveries"][0]["state"], "completed")
         self.assertNotIn("origin_thread_id", stored)
         self.assertEqual(stored["worker_public_key_hex"], WORKER_HEX)
         self.assertEqual(stored["event_id"], receipt["event_id"])
@@ -106,11 +117,121 @@ class RoundtripTests(unittest.TestCase):
         self.assertEqual(shown["task"], TASK)
         self.assertEqual(shown["origin_chat_id"], ORIGIN_CHAT)
         self.assertEqual(shown["reply_event_ids"], [INBOUND_EVENT])
+        self.assertEqual(shown["reply_deliveries"][0]["state"], "completed")
         self.assertNotIn("task viewer", json.dumps(shown))
 
         again = self._resume_after_restart(receipt["event_id"], RESULT, INBOUND_EVENT)
-        self.assertEqual(again["chat_id"], ORIGIN_CHAT)
+        self.assertEqual(again["delivery"], "completed")
+        self.assertIsNone(again["wake"])
+        self.assertIs(again["suppress_worker_delivery"], True)
         self.assertEqual(read_record(self.journal, receipt["delegation_id"])["reply_event_ids"], [INBOUND_EVENT])
+
+    def test_concurrent_intake_wakes_once_and_a_dead_owner_can_be_recovered(self) -> None:
+        receipt = self.delegate()
+        owner = "ab" * 16
+        pid = os.getpid()
+        barrier = threading.Barrier(2)
+        found: list = []
+
+        def once() -> None:
+            barrier.wait(5)
+            found.append(
+                evaluate_inbound_reply(
+                    self.journal,
+                    reply_to_message_id=receipt["event_id"],
+                    sender_public_key_hex=WORKER_HEX,
+                    inbound_text=RESULT,
+                    inbound_event_id=INBOUND_EVENT,
+                    gateway_owner=owner,
+                    gateway_pid=pid,
+                )
+            )
+
+        threads = [threading.Thread(target=once), threading.Thread(target=once)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        wakes = [plan for plan in found if plan.delivery == "wake"]
+        inflight = [plan for plan in found if plan.delivery == "in_flight"]
+        self.assertEqual(len(wakes), 1)
+        self.assertEqual(len(inflight), 1)
+        self.assertIsNone(inflight[0].wake_text)
+        self.assertIs(inflight[0].suppress_worker_delivery, True)
+        self.assertEqual(read_record(self.journal, receipt["delegation_id"])["reply_event_ids"], [INBOUND_EVENT])
+        stolen = recover_unfinished_replies(self.journal, gateway_owner="cd" * 16, gateway_pid=pid)
+        self.assertEqual(stolen, [])
+
+        dead = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], check=True, capture_output=True, text=True)
+        dead_pid = int(dead.stdout.strip())
+        release_reply_claim(self.journal, receipt["delegation_id"], INBOUND_EVENT, wakes[0].claim_id)
+        crashed = evaluate_inbound_reply(
+            self.journal,
+            reply_to_message_id=receipt["event_id"],
+            sender_public_key_hex=WORKER_HEX,
+            inbound_text=RESULT,
+            inbound_event_id=INBOUND_EVENT,
+            gateway_owner="ef" * 16,
+            gateway_pid=dead_pid,
+        )
+        self.assertEqual(crashed.delivery, "wake")
+        recovered = recover_unfinished_replies(self.journal, gateway_owner="12" * 16, gateway_pid=pid)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].delivery, "wake")
+        self.assertIn(RESULT, recovered[0].wake_text or "")
+        self.assertIn(TASK, recovered[0].wake_text or "")
+        again = recover_unfinished_replies(self.journal, gateway_owner="34" * 16, gateway_pid=pid)
+        self.assertEqual(again, [])
+        self.assertTrue(
+            complete_reply_delivery(self.journal, receipt["delegation_id"], INBOUND_EVENT, recovered[0].claim_id)
+        )
+        quiet = evaluate_inbound_reply(
+            self.journal,
+            reply_to_message_id=receipt["event_id"],
+            sender_public_key_hex=WORKER_HEX,
+            inbound_text=RESULT,
+            inbound_event_id=INBOUND_EVENT,
+            gateway_owner=owner,
+            gateway_pid=pid,
+        )
+        self.assertEqual(quiet.delivery, "completed")
+        self.assertIsNone(quiet.wake_text)
+        self.assertIs(quiet.suppress_worker_delivery, True)
+
+    def test_missing_adapter_release_is_recovered_once(self) -> None:
+        receipt = self.delegate()
+        plan = evaluate_inbound_reply(
+            self.journal,
+            reply_to_message_id=receipt["event_id"],
+            sender_public_key_hex=WORKER_HEX,
+            inbound_text=RESULT,
+            inbound_event_id=INBOUND_EVENT,
+        )
+        self.assertEqual(plan.delivery, "wake")
+        self.assertTrue(release_reply_claim(self.journal, receipt["delegation_id"], INBOUND_EVENT, plan.claim_id or ""))
+        stored = read_record(self.journal, receipt["delegation_id"])
+        assert stored is not None
+        self.assertEqual(stored["reply_deliveries"][0]["state"], "pending")
+        duplicate = evaluate_inbound_reply(
+            self.journal,
+            reply_to_message_id=receipt["event_id"],
+            sender_public_key_hex=WORKER_HEX,
+            inbound_text=RESULT,
+            inbound_event_id=INBOUND_EVENT,
+        )
+        self.assertEqual(duplicate.delivery, "wake")
+        self.assertTrue(
+            complete_reply_delivery(self.journal, receipt["delegation_id"], INBOUND_EVENT, duplicate.claim_id or "")
+        )
+        done = evaluate_inbound_reply(
+            self.journal,
+            reply_to_message_id=receipt["event_id"],
+            sender_public_key_hex=WORKER_HEX,
+            inbound_text=RESULT,
+            inbound_event_id=INBOUND_EVENT,
+        )
+        self.assertEqual(done.delivery, "completed")
+        self.assertIsNone(done.wake_text)
 
     def test_topic_origin_is_stored_and_kept_out_of_the_worker_message(self) -> None:
         env = dict(self.env)
@@ -323,6 +444,9 @@ class RoundtripTests(unittest.TestCase):
             "    'acknowledge_worker': plan.acknowledge_worker,\n"
             "    'wake': plan.wake_text,\n"
             "    'reason': plan.reason,\n"
+            "    'delivery': plan.delivery,\n"
+            "    'claim_id': plan.claim_id,\n"
+            "    'delegation_id': plan.delegation_id,\n"
             "}, sys.stdout)\n"
         )
         env = dict(os.environ)
