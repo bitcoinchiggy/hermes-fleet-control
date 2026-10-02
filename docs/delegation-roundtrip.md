@@ -48,27 +48,44 @@ worker key. A match suppresses worker delivery and worker error
 notices. When the stored origin is usable, `wake_text` contains the
 original task and the worker result, and `report_to` is that human
 conversation. The first successful claim records `reply_deliveries` as
-`inflight`. After the origin adapter accepts the turn, the gateway
-marks that reply `completed`. A later intake of the same event returns
-`delivery: completed` and no `wake_text`. A second concurrent intake
-sees the live claim and returns `delivery: in_flight`, also with no
-wake. A mismatched sender or a record with no origin suppresses the
-worker turn and does not guess a destination. A different `reply_to`
-stays on the normal gateway path. A further instruction is a new
-`delegate_worker` call, which sends a new top-level DM with no
-`--reply-to`.
+`inflight`. That is handed off: the origin adapter accepted the turn,
+and the model has not produced a report yet. A later intake of a
+`completed` reply returns `delivery: completed` and no `wake_text`. A
+second concurrent intake sees the live claim and returns
+`delivery: in_flight`, also with no wake. A mismatched sender or a
+record with no origin suppresses the worker turn and does not guess a
+destination. A different `reply_to` stays on the normal gateway path. A
+further instruction is a new `delegate_worker` call, which sends a new
+top-level DM with no `--reply-to`.
+
+Three outcomes are distinct. Finishing the adapter session task does
+not prove the human received the report.
+
+- Handed off. The adapter accepted the turn. If the model fails before
+  a report, or gateway shutdown cancels the turn before
+  `send_final_ledgered` records an obligation, the claim returns to
+  `pending` and the worker text stays in `reply-holds/`. Fleet recovery
+  owns the next evaluation. The Hermes delivery ledger has nothing to
+  redeliver.
+- Report pending delivery. The model produced the report and
+  `send_final_ledgered` stored it, then returned
+  `SendResult(success=False)`. The journal is `completed` so the model
+  is not run again. The Hermes delivery ledger owns redelivery,
+  including its recovered-reply marker. `completed` here means "do not
+  evaluate again," not "the human has the message."
+- Delivered. The human send returned success. The journal is
+  `completed`. A crash after that successful send and before the
+  completion write can produce a second human report; that window is
+  at-least-once.
 
 If the human adapter is missing, or resume fails before the adapter
-accepts the turn, the claim is released to `pending` and the worker
-text stays in `reply-holds/` under the journal directory. Recovery
-claims that pending reply again. An `inflight` claim whose pid is no
-longer running is recovered the same way. A live pid is not stolen.
-Completion is recorded only after the adapter's session task finishes.
-A crash after that task sends and before the completion write can
-produce a second human report; that window is at-least-once. A
+accepts the turn, the claim is released to `pending`. Recovery claims
+that pending reply again. An `inflight` claim whose pid is no longer
+running is recovered the same way. A live pid is not stolen. A
 completed reply is not woken again. The worker DM is not used as the
 retry path, so an interrupted handoff is not silently replaced by a
-model turn in the worker conversation.
+model turn in the worker conversation. If the ledger later abandons a
+failed obligation, fleet recovery does not start another model turn.
 
 ## Hermes patch
 
