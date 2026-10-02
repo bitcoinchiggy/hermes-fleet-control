@@ -68,11 +68,13 @@ not prove the human received the report.
   owns the next evaluation. The Hermes delivery ledger has nothing to
   redeliver.
 - Report pending delivery. The model produced the report and
-  `send_final_ledgered` stored it, then returned
-  `SendResult(success=False)`. The journal is `completed` so the model
-  is not run again. The Hermes delivery ledger owns redelivery,
-  including its recovered-reply marker. `completed` here means "do not
-  evaluate again," not "the human has the message."
+  `send_final_ledgered` stored this handoff's own obligation, then
+  returned `SendResult(success=False)`. The journal is `completed` so
+  the model is not run again. The Hermes delivery ledger owns redelivery
+  of that row, including its recovered-reply marker. A successful turn
+  in the same session, or that turn's ledger row, does not complete this
+  handoff. `completed` here means "do not evaluate again," not "the
+  human has the message."
 - Delivered. The human send returned success. The journal is
   `completed`. A crash after that successful send and before the
   completion write can produce a second human report; that window is
