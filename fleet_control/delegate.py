@@ -184,6 +184,7 @@ def _with_lock(
             origin_platform=origin.platform,
             origin_chat_id=origin.chat_id,
             origin_session_key=origin.session_key,
+            **_route_fields(origin),
         )
         write_record(directory, record)
     elif not _has_origin(record):
@@ -194,7 +195,11 @@ def _with_lock(
             origin_chat_id=origin.chat_id,
             origin_session_key=origin.session_key,
             reply_event_ids=[],
+            **_route_fields(origin),
         )
+        write_record(directory, record)
+    elif origin.chat_type and "origin_chat_type" not in record and _same_origin(record, origin):
+        record = update_record(record, **_route_fields(origin))
         write_record(directory, record)
 
     identity = _identity(
@@ -318,11 +323,36 @@ def _has_origin(record: dict[str, Any]) -> bool:
     return "origin_platform" in record
 
 
+def _route_fields(origin: Any) -> dict[str, str]:
+    """Journal route keys. Omitted when this origin has no chat type."""
+    if not origin.chat_type:
+        return {}
+    return {
+        "origin_thread_id": origin.thread_id,
+        "origin_message_id": origin.message_id,
+        "origin_chat_type": origin.chat_type,
+        "origin_scope_id": origin.scope_id,
+        "origin_user_id": origin.user_id,
+    }
+
+
 def _same_origin(record: dict[str, Any], origin: Any) -> bool:
+    if (
+        record.get("origin_platform") != origin.platform
+        or record.get("origin_chat_id") != origin.chat_id
+        or record.get("origin_session_key") != origin.session_key
+    ):
+        return False
+    if "origin_chat_type" not in record:
+        return True
+    if not origin.chat_type:
+        return False
     return (
-        record.get("origin_platform") == origin.platform
-        and record.get("origin_chat_id") == origin.chat_id
-        and record.get("origin_session_key") == origin.session_key
+        record.get("origin_thread_id") == origin.thread_id
+        and record.get("origin_message_id") == origin.message_id
+        and record.get("origin_chat_type") == origin.chat_type
+        and record.get("origin_scope_id") == origin.scope_id
+        and record.get("origin_user_id") == origin.user_id
     )
 
 

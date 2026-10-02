@@ -18,7 +18,30 @@ from fleet_control.errors import fail
 ORIGIN_PLATFORM = "FLEET_CONTROL_ORIGIN_PLATFORM"
 ORIGIN_CHAT_ID = "FLEET_CONTROL_ORIGIN_CHAT_ID"
 ORIGIN_SESSION_KEY = "FLEET_CONTROL_ORIGIN_SESSION_KEY"
-ORIGIN_ENV_KEYS = (ORIGIN_PLATFORM, ORIGIN_CHAT_ID, ORIGIN_SESSION_KEY)
+ORIGIN_THREAD_ID = "FLEET_CONTROL_ORIGIN_THREAD_ID"
+ORIGIN_MESSAGE_ID = "FLEET_CONTROL_ORIGIN_MESSAGE_ID"
+ORIGIN_CHAT_TYPE = "FLEET_CONTROL_ORIGIN_CHAT_TYPE"
+ORIGIN_SCOPE_ID = "FLEET_CONTROL_ORIGIN_SCOPE_ID"
+ORIGIN_USER_ID = "FLEET_CONTROL_ORIGIN_USER_ID"
+ORIGIN_ENV_KEYS = (
+    ORIGIN_PLATFORM,
+    ORIGIN_CHAT_ID,
+    ORIGIN_SESSION_KEY,
+    ORIGIN_THREAD_ID,
+    ORIGIN_MESSAGE_ID,
+    ORIGIN_CHAT_TYPE,
+    ORIGIN_SCOPE_ID,
+    ORIGIN_USER_ID,
+)
+_CORE_KEYS = (ORIGIN_PLATFORM, ORIGIN_CHAT_ID, ORIGIN_SESSION_KEY)
+_ROUTE_KEYS = (
+    ORIGIN_THREAD_ID,
+    ORIGIN_MESSAGE_ID,
+    ORIGIN_CHAT_TYPE,
+    ORIGIN_SCOPE_ID,
+    ORIGIN_USER_ID,
+)
+_CHAT_TYPES = frozenset({"dm", "group", "channel", "thread"})
 
 _PLATFORM_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _MAX_CHAT_ID = 256
@@ -45,30 +68,69 @@ _NON_MESSAGING = frozenset(
 
 @dataclass(frozen=True)
 class ReplyOrigin:
-    """Human conversation that asked for the delegation."""
+    """Human conversation that asked for the delegation.
+
+    ``thread_id`` is the platform topic (Telegram topic, Buzz NIP-10 root).
+    ``message_id`` is the reply anchor that keeps a topic lane visible.
+    Both are empty when the conversation has no topic. ``chat_type`` is
+    empty only on records written before the route fields existed.
+    """
 
     platform: str
     chat_id: str
     session_key: str
+    thread_id: str = ""
+    message_id: str = ""
+    chat_type: str = ""
+    scope_id: str = ""
+    user_id: str = ""
 
 
 def read_trusted_origin(env: Mapping[str, str]) -> ReplyOrigin | None:
-    """Return the per-call origin, or None when all three variables are absent.
+    """Return the per-call origin, or None when the core variables are absent.
 
     A partial or invalid assignment fails closed. It is not treated as a
-    missing origin.
+    missing origin. Route fields are optional as a group: all absent keeps
+    the older three-field origin, and any one of them requires the rest.
     """
-    values = [env.get(key) for key in ORIGIN_ENV_KEYS]
-    if all(value is None or value == "" for value in values):
+    core = [env.get(key) for key in _CORE_KEYS]
+    route = [env.get(key) for key in _ROUTE_KEYS]
+    if all(value is None or value == "" for value in core):
+        if any(value not in (None, "") for value in route):
+            raise fail("origin_unavailable")
         return None
-    platform, chat_id, session_key = values
-    origin = parse_origin(platform, chat_id, session_key)
+    if any(value is None for value in route) and any(value is not None for value in route):
+        raise fail("origin_unavailable")
+    platform, chat_id, session_key = core
+    if all(value is None for value in route):
+        origin = parse_origin(platform, chat_id, session_key)
+    else:
+        thread_id, message_id, chat_type, scope_id, user_id = route
+        origin = parse_origin(
+            platform,
+            chat_id,
+            session_key,
+            thread_id=thread_id,
+            message_id=message_id,
+            chat_type=chat_type,
+            scope_id=scope_id,
+            user_id=user_id,
+        )
     if origin is None:
         raise fail("origin_unavailable")
     return origin
 
 
-def parse_origin(platform: object, chat_id: object, session_key: object) -> ReplyOrigin | None:
+def parse_origin(
+    platform: object,
+    chat_id: object,
+    session_key: object,
+    thread_id: object = "",
+    message_id: object = "",
+    chat_type: object = "",
+    scope_id: object = "",
+    user_id: object = "",
+) -> ReplyOrigin | None:
     """Validate one stored or trusted origin. Return None when it is unusable."""
     if not isinstance(platform, str) or _PLATFORM_RE.fullmatch(platform) is None:
         return None
@@ -78,7 +140,10 @@ def parse_origin(platform: object, chat_id: object, session_key: object) -> Repl
     session = _bounded(session_key, _MAX_SESSION_KEY)
     if chat is None or session is None:
         return None
-    return ReplyOrigin(platform=platform, chat_id=chat, session_key=session)
+    route = _route(thread_id, message_id, chat_type, scope_id, user_id)
+    if route is None:
+        return None
+    return ReplyOrigin(platform=platform, chat_id=chat, session_key=session, **route)
 
 
 def targets_worker_dm(origin: ReplyOrigin, channel_id: str) -> bool:
@@ -87,6 +152,44 @@ def targets_worker_dm(origin: ReplyOrigin, channel_id: str) -> bool:
     if origin.platform == "buzz" and origin.chat_id.casefold() == channel:
         return True
     return channel in [part.casefold() for part in origin.session_key.split(":")]
+
+
+def _route(
+    thread_id: object,
+    message_id: object,
+    chat_type: object,
+    scope_id: object,
+    user_id: object,
+) -> dict[str, str] | None:
+    """Validate the topic route. An all-empty route is the older origin."""
+    values = (thread_id, message_id, chat_type, scope_id, user_id)
+    if all(value == "" for value in values):
+        return {
+            "thread_id": "",
+            "message_id": "",
+            "chat_type": "",
+            "scope_id": "",
+            "user_id": "",
+        }
+    if not isinstance(chat_type, str) or chat_type not in _CHAT_TYPES:
+        return None
+    cleaned: list[str] = []
+    for value in (thread_id, message_id, scope_id, user_id):
+        if value == "":
+            cleaned.append("")
+            continue
+        bounded = _bounded(value, _MAX_CHAT_ID)
+        if bounded is None:
+            return None
+        cleaned.append(bounded)
+    thread, message, scope, user = cleaned
+    return {
+        "thread_id": thread,
+        "message_id": message,
+        "chat_type": chat_type,
+        "scope_id": scope,
+        "user_id": user,
+    }
 
 
 def _bounded(value: object, limit: int) -> str | None:

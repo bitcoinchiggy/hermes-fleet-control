@@ -1,6 +1,7 @@
-"""Human to worker and back, using the real delegate and intake functions.
+"""Helper-only test. Human to worker and back, using the real delegate and intake functions.
 
-Buzz and Fleet are fakes. Nothing is sent to a relay.
+Buzz and Fleet are fakes. Nothing is sent to a relay. This module does not
+import Hermes and does not exercise the gateway adapter.
 """
 
 from __future__ import annotations
@@ -98,6 +99,7 @@ class RoundtripTests(unittest.TestCase):
         stored = read_record(self.journal, receipt["delegation_id"])
         assert stored is not None
         self.assertEqual(stored["reply_event_ids"], [INBOUND_EVENT])
+        self.assertNotIn("origin_thread_id", stored)
         self.assertEqual(stored["worker_public_key_hex"], WORKER_HEX)
         self.assertEqual(stored["event_id"], receipt["event_id"])
         shown = show_delegation(self.journal, receipt["delegation_id"])
@@ -109,6 +111,42 @@ class RoundtripTests(unittest.TestCase):
         again = self._resume_after_restart(receipt["event_id"], RESULT, INBOUND_EVENT)
         self.assertEqual(again["chat_id"], ORIGIN_CHAT)
         self.assertEqual(read_record(self.journal, receipt["delegation_id"])["reply_event_ids"], [INBOUND_EVENT])
+
+    def test_topic_origin_is_stored_and_kept_out_of_the_worker_message(self) -> None:
+        env = dict(self.env)
+        env.update(
+            {
+                "FLEET_CONTROL_ORIGIN_THREAD_ID": "99",
+                "FLEET_CONTROL_ORIGIN_MESSAGE_ID": "555",
+                "FLEET_CONTROL_ORIGIN_CHAT_TYPE": "dm",
+                "FLEET_CONTROL_ORIGIN_SCOPE_ID": "",
+                "FLEET_CONTROL_ORIGIN_USER_ID": "42",
+                "FLEET_CONTROL_ORIGIN_SESSION_KEY": "agent:main:telegram:dm:424242:99",
+            }
+        )
+        receipt = self.delegate(environ=env)
+        stdin = self.buzz.calls[1]["stdin"].decode()
+        self.assertEqual(stdin, f"[fleet-delegation {receipt['delegation_id']}]\n{TASK}")
+        self.assertNotIn("424242", stdin)
+        stored = read_record(self.journal, receipt["delegation_id"])
+        assert stored is not None
+        self.assertEqual(stored["origin_thread_id"], "99")
+        self.assertEqual(stored["origin_message_id"], "555")
+        self.assertEqual(stored["origin_chat_type"], "dm")
+        self.assertEqual(stored["origin_user_id"], "42")
+        plan = evaluate_inbound_reply(
+            self.journal,
+            reply_to_message_id=receipt["event_id"],
+            sender_public_key_hex=WORKER_HEX,
+            inbound_text=RESULT,
+            inbound_event_id=INBOUND_EVENT,
+        )
+        assert plan.report_to is not None
+        self.assertEqual(plan.report_to.thread_id, "99")
+        self.assertEqual(plan.report_to.message_id, "555")
+        self.assertEqual(plan.report_to.chat_type, "dm")
+        self.assertIn(RESULT, plan.wake_text or "")
+        self.assertNotIn("999", plan.wake_text or "")
 
     def test_mismatched_sender_and_unknown_origin_do_not_guess(self) -> None:
         receipt = self.delegate()
