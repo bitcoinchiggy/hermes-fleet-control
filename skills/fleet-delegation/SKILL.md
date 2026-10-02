@@ -5,7 +5,7 @@ description: Assign work to a Fleet worker with delegate_worker, and report that
 
 # Fleet delegation
 
-delegate_worker remains the preferred structured primitive for assigning work to Fleet workers. Pass the Fleet worker name, the task, and an optional delegation id. Do not choose a channel, a public key, or a relay. `relay_accepted` means the relay stored the delegation. It is not worker execution and not task completion. The worker reply arrives later as a separate Buzz turn.
+delegate_worker remains the preferred structured primitive for assigning work to Fleet workers. Pass the Fleet worker name, the task, and an optional delegation id. Do not choose a channel, a public key, or a relay. `relay_accepted` means the relay stored the delegation. It is not worker execution and not task completion. A worker reply is evaluated in the originating human conversation and is not automatically acknowledged in the worker DM. A further instruction is a new delegate_worker call.
 
 Do not weaken Buzz mention validation. Do not add a generic message-sending tool. Do not add the worker to the current conversation just so a status @mention will pass. Control retains its other authorized tools for diagnosis, recovery, and general communication.
 

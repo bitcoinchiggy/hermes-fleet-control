@@ -11,7 +11,13 @@ read worker status, ensure one worker, and delegate a task over Buzz.
 
 `delegate_worker` returns when the relay accepts the signed event.
 `delivery` is `relay_accepted`. That is not worker execution and not
-task completion. A later worker reply is a separate Buzz turn.
+task completion. A worker reply is evaluated in the originating human
+conversation and is not automatically acknowledged in the worker DM.
+`fleet_control.delegation_reply.plan_delegation_reply` is that decision.
+The originating session is not available to the MCP process, and the
+journal does not store it. Deployed Hermes
+`7817bf522af3caf54b30ae59f16157469d7638fc` does not call the planner, so
+that gateway still delivers its reply into the worker DM.
 
 When Control reports that status to the human, it uses the worker's
 plain name (`operator`), not `@operator`, unless that worker is a
@@ -57,7 +63,7 @@ python3 install-control-runtime --python /usr/bin/python3.12
 ```
 
 That installs the hashed `requirements.lock` (`cryptography==50.0.2`,
-`cffi==2.1.1`, `pycparser==3.0`) with `--require-hashes` and
+`PyYAML==6.0.2`, `cffi==2.1.1`, `pycparser==3.0`) with `--require-hashes` and
 `--only-binary=:all:`. The MCP server execs `runtime/venv/bin/python`
 and passes the helper script as an argument. A missing interpreter is
 `helper_failed`, not a `PATH` search. A direct helper re-execs that
