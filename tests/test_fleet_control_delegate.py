@@ -893,6 +893,7 @@ class McpSourceTests(unittest.TestCase):
             "An @mention used by the human to identify a worker is input syntax and must not automatically be echoed as an @mention into a different Buzz conversation.",
             "Write: Delegated to operator — relay accepted.",
             "Do not write: Delegated to @operator — relay accepted.",
+            "A worker reply is evaluated in the originating human conversation and is not automatically acknowledged in the worker DM. A further instruction is a new delegate_worker call.",
         )
         for sentence in required:
             self.assertIn(sentence, text)

@@ -39,6 +39,7 @@ RUNTIME_MODULES = (
     "fleet_control.buzz_exec",
     "fleet_control.config",
     "fleet_control.delegate",
+    "fleet_control.delegation_reply",
     "fleet_control.ensure",
     "fleet_control.errors",
     "fleet_control.hermes_authz",
