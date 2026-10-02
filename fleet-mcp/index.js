@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { originEnvFromMeta, ORIGIN_ENV_KEYS } from "./origin-env.js";
 import { helperSpawnSpec } from "./python-bin.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -28,10 +29,17 @@ const FORBIDDEN_ENV = [
   "PVE_TOKEN_SECRET",
 ];
 
-function helperEnv() {
+function helperEnv(extraEnv) {
   const env = { ...process.env };
-  for (const key of FORBIDDEN_ENV) {
+  for (const key of [...FORBIDDEN_ENV, ...ORIGIN_ENV_KEYS]) {
     delete env[key];
+  }
+  if (extraEnv) {
+    for (const key of ORIGIN_ENV_KEYS) {
+      if (typeof extraEnv[key] === "string") {
+        env[key] = extraEnv[key];
+      }
+    }
   }
   return env;
 }
@@ -57,7 +65,7 @@ function forbiddenFailure() {
   });
 }
 
-function runHelper(script, args, stdinText) {
+function runHelper(script, args, stdinText, extraEnv) {
   if (refusedEnvironment()) {
     return Promise.resolve(forbiddenFailure());
   }
@@ -65,6 +73,7 @@ function runHelper(script, args, stdinText) {
   if (!spec) {
     return Promise.resolve(helperFailure());
   }
+  const env = helperEnv(extraEnv);
   return new Promise((resolve) => {
     let settled = false;
     const finish = (text) => {
@@ -78,7 +87,7 @@ function runHelper(script, args, stdinText) {
     try {
       child = spawn(spec.command, spec.args, {
         shell: false,
-        env: helperEnv(),
+        env,
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch {
@@ -148,7 +157,7 @@ server.registerTool(
   "delegate_worker",
   {
     description:
-      "Delegate a task to one ready Fleet worker over Buzz. Signs on Control. Returns relay_accepted when the relay accepts the DM. relay_accepted is not worker execution and not task completion. A worker reply is evaluated in the originating human conversation and is not automatically acknowledged in the worker DM. A further instruction is a new delegate_worker call. If a delegation call returns an error containing delegation_id, any retry of that same task MUST reuse that exact delegation_id. A caller must not create a new delegation merely because delivery outcome was uncertain. Reusing an id whose delivery is uncertain does not send the message again. delegate_worker remains the preferred structured primitive for assigning work to Fleet workers. Do not weaken Buzz mention validation. Do not add a generic message-sending tool. Do not add the worker to the current conversation just so a status @mention will pass. Control retains its other authorized tools for diagnosis, recovery, and general communication. When reporting delegation or status back to the human, refer to the Fleet worker by plain name, for example operator, not @operator, unless that worker is actually a member of the current Buzz conversation and an intentional mention is required. An @mention used by the human to identify a worker is input syntax and must not automatically be echoed as an @mention into a different Buzz conversation. Write: Delegated to operator — relay accepted. Do not write: Delegated to @operator — relay accepted.",
+      "Delegate a task to one ready Fleet worker over Buzz. Signs on Control. Returns relay_accepted when the relay accepts the DM. relay_accepted is not worker execution and not task completion. A worker reply is evaluated in the originating human conversation and is not automatically acknowledged in the worker DM. A further instruction is a new delegate_worker call. If a delegation call returns an error containing delegation_id, any retry of that same task MUST reuse that exact delegation_id. A caller must not create a new delegation merely because delivery outcome was uncertain. Reusing an id whose delivery is uncertain does not send the message again. delegate_worker remains the preferred structured primitive for assigning work to Fleet workers. Do not weaken Buzz mention validation. Do not add a generic message-sending tool. Do not add the worker to the current conversation just so a status @mention will pass. Control retains its other authorized tools for diagnosis, recovery, and general communication. When reporting delegation or status back to the human, refer to the Fleet worker by plain name, for example operator, not @operator, unless that worker is actually a member of the current Buzz conversation and an intentional mention is required. An @mention used by the human to identify a worker is input syntax and must not automatically be echoed as an @mention into a different Buzz conversation. Write: Delegated to operator — relay accepted. Do not write: Delegated to @operator — relay accepted. Private Control-worker exchanges stay in the worker DM, and the human receives the evaluated result in the originating conversation.",
     inputSchema: {
       worker: z.string(),
       task: z.string().min(1).max(8000),
@@ -158,12 +167,19 @@ server.registerTool(
         .optional(),
     },
   },
-  async ({ worker, task, delegation_id }) => {
+  async ({ worker, task, delegation_id }, extra) => {
     const payload = { worker, task };
     if (delegation_id !== undefined) {
       payload.delegation_id = delegation_id;
     }
-    return textResult(await runHelper(delegateBin, [], JSON.stringify(payload)));
+    return textResult(
+      await runHelper(
+        delegateBin,
+        [],
+        JSON.stringify(payload),
+        originEnvFromMeta(extra && extra._meta),
+      ),
+    );
   },
 );
 

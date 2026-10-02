@@ -1,14 +1,15 @@
-"""Decide whether an inbound Buzz message is a worker reply to a delegation.
+"""Decide how Control treats an inbound Buzz message that may be a worker reply.
 
-This module does not send messages and does not read or write the journal.
-Deployed Hermes ``7817bf522af3caf54b30ae59f16157469d7638fc`` does not call
-``plan_delegation_reply``. Until the gateway consults the plan before
-``adapter.send``, Control's answer is still delivered into the worker DM.
+``acknowledge_worker is None`` means this plan does not apply.
+``False`` means a correlated reply is not answered in the worker DM.
+``suppress_worker_delivery`` and ``suppress_worker_error`` are true for
+every correlated reply, including an unknown origin or a mismatched
+sender, so neither an acknowledgement nor an error notice starts another
+worker turn.
 
-``acknowledge_worker is None`` means this plan does not apply and the
-gateway should keep its normal path. ``False`` means a correlated worker
-reply must not be answered in the worker DM. A further instruction is a
-new ``delegate_worker`` call, which sends a new top-level DM.
+The destination is the origin stored when the delegation was accepted.
+This function does not accept a caller-supplied route, and it does not
+read a route out of the reply text.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import re
 from dataclasses import dataclass
 from typing import Mapping
 
+from fleet_control.origin import ReplyOrigin, parse_origin, targets_worker_dm
 from fleet_control.support.names import NAME_RE
 
 KIND_DELEGATION_REPLY = "delegation_reply"
@@ -26,31 +28,21 @@ REASON_ORIGIN_INVALID = "origin_invalid"
 REASON_NOT_ACCEPTED = "delegation_not_accepted"
 REASON_RECORD_UNUSABLE = "record_unusable"
 REASON_REPLY_UNSAFE = "reply_unsafe"
+REASON_SENDER_MISMATCH = "sender_mismatch"
 
 _DELEGATION_ID_RE = re.compile(r"^dlg_[0-9a-f]{32}$")
-_PLATFORM_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-_MAX_CHAT_ID = 256
-_MAX_SESSION_KEY = 512
+_HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _MAX_CHANNEL_ID = 256
 _MAX_REPLY_TEXT = 8000
-
-
-@dataclass(frozen=True)
-class ReplyOrigin:
-    """Trusted human destination supplied by the gateway, not by message text."""
-
-    platform: str
-    chat_id: str
-    session_key: str
+_NO_NOTE = frozenset({REASON_SENDER_MISMATCH, REASON_NOT_ACCEPTED, REASON_RECORD_UNUSABLE})
 
 
 @dataclass(frozen=True)
 class DelegationReplyPlan:
-    """What Control should do with one inbound message.
+    """Gateway instruction for one inbound message.
 
-    ``wake_text`` is present only when ``report_to`` is set. It names the
-    delegation and quotes the inbound reply. It does not contain the
-    original task.
+    ``wake_text`` is present only together with ``report_to``. It contains
+    the stored task and the inbound worker result.
     """
 
     kind: str
@@ -61,6 +53,30 @@ class DelegationReplyPlan:
     parent_text_present: bool
     report_to: ReplyOrigin | None
     wake_text: str | None
+    suppress_worker_delivery: bool | None
+    suppress_worker_error: bool | None
+
+    def public_body(self) -> dict[str, object]:
+        """JSON the gateway can apply. Secret-shaped replies never reach it."""
+        destination = None
+        if self.report_to is not None:
+            destination = {
+                "platform": self.report_to.platform,
+                "chat_id": self.report_to.chat_id,
+                "session_key": self.report_to.session_key,
+            }
+        return {
+            "kind": self.kind,
+            "acknowledge_worker": self.acknowledge_worker,
+            "reason": self.reason,
+            "delegation_id": self.delegation_id,
+            "worker": self.worker,
+            "parent_text_present": self.parent_text_present,
+            "report_to": destination,
+            "wake_text": self.wake_text,
+            "suppress_worker_delivery": self.suppress_worker_delivery,
+            "suppress_worker_error": self.suppress_worker_error,
+        }
 
 
 def plan_delegation_reply(
@@ -69,14 +85,9 @@ def plan_delegation_reply(
     reply_to_message_id: str | None,
     reply_to_text: str | None,
     inbound_text: str,
-    origin: ReplyOrigin | None = None,
+    sender_public_key_hex: str | None,
 ) -> DelegationReplyPlan:
-    """Correlate one inbound message with one journal record.
-
-    ``origin`` is a separate trusted argument. Text inside the reply is
-    never parsed into a destination. A missing or different
-    ``reply_to_message_id`` leaves the message on the normal gateway path.
-    """
+    """Correlate one inbound message with one journal record."""
     event_id = record.get("event_id") if isinstance(record, Mapping) else None
     if (
         not isinstance(reply_to_message_id, str)
@@ -87,21 +98,28 @@ def plan_delegation_reply(
         return _untouched()
 
     parent_text_present = isinstance(reply_to_text, str) and bool(reply_to_text.strip())
+    delegation_id = _delegation_id(record)
+    worker = _worker(record)
     if record.get("state") != "accepted":
         return _correlated(
             reason=REASON_NOT_ACCEPTED,
             parent_text_present=parent_text_present,
-            delegation_id=_delegation_id(record),
-            worker=_worker(record),
+            delegation_id=delegation_id,
+            worker=worker,
         )
 
-    delegation_id = _delegation_id(record)
-    worker = _worker(record)
     channel_id = _channel_id(record)
     if delegation_id is None or worker is None or channel_id is None:
         return _correlated(
             reason=REASON_RECORD_UNUSABLE,
             parent_text_present=parent_text_present,
+        )
+    if not _sender_matches(record.get("worker_public_key_hex"), sender_public_key_hex):
+        return _correlated(
+            reason=REASON_SENDER_MISMATCH,
+            parent_text_present=parent_text_present,
+            delegation_id=delegation_id,
+            worker=worker,
         )
 
     reply = _reply_text(inbound_text)
@@ -112,18 +130,31 @@ def plan_delegation_reply(
             delegation_id=delegation_id,
             worker=worker,
         )
-    if origin is None:
+
+    origin = parse_origin(
+        record.get("origin_platform"),
+        record.get("origin_chat_id"),
+        record.get("origin_session_key"),
+    )
+    if "origin_platform" not in record:
         return _correlated(
             reason=REASON_ORIGIN_UNKNOWN,
             parent_text_present=parent_text_present,
             delegation_id=delegation_id,
             worker=worker,
         )
-
-    destination = _destination(origin, channel_id)
-    if destination is None:
+    if origin is None or targets_worker_dm(origin, channel_id):
         return _correlated(
             reason=REASON_ORIGIN_INVALID,
+            parent_text_present=parent_text_present,
+            delegation_id=delegation_id,
+            worker=worker,
+        )
+
+    task = record.get("task")
+    if not isinstance(task, str) or not task.strip():
+        return _correlated(
+            reason=REASON_RECORD_UNUSABLE,
             parent_text_present=parent_text_present,
             delegation_id=delegation_id,
             worker=worker,
@@ -133,9 +164,14 @@ def plan_delegation_reply(
         parent_text_present=parent_text_present,
         delegation_id=delegation_id,
         worker=worker,
-        report_to=destination,
-        wake_text=_wake(delegation_id, worker, reply),
+        report_to=origin,
+        wake_text=_wake(delegation_id, worker, task, reply),
     )
+
+
+def should_note_reply(plan: DelegationReplyPlan) -> bool:
+    """Link a verified worker reply into the task record."""
+    return plan.kind == KIND_DELEGATION_REPLY and plan.reason not in _NO_NOTE
 
 
 def _untouched() -> DelegationReplyPlan:
@@ -148,6 +184,8 @@ def _untouched() -> DelegationReplyPlan:
         parent_text_present=False,
         report_to=None,
         wake_text=None,
+        suppress_worker_delivery=None,
+        suppress_worker_error=None,
     )
 
 
@@ -169,6 +207,8 @@ def _correlated(
         parent_text_present=parent_text_present,
         report_to=report_to,
         wake_text=wake_text,
+        suppress_worker_delivery=True,
+        suppress_worker_error=True,
     )
 
 
@@ -187,57 +227,38 @@ def _worker(record: Mapping[str, object]) -> str | None:
 
 
 def _channel_id(record: Mapping[str, object]) -> str | None:
-    return _bounded(record.get("channel_id"), _MAX_CHANNEL_ID)
+    value = record.get("channel_id")
+    if not isinstance(value, str) or not value or len(value) > _MAX_CHANNEL_ID:
+        return None
+    if any(ord(char) < 32 or char.isspace() for char in value):
+        return None
+    return value
+
+
+def _sender_matches(expected: object, sender: object) -> bool:
+    if not isinstance(expected, str) or not isinstance(sender, str):
+        return False
+    if not _HEX64_RE.fullmatch(expected) or not _HEX64_RE.fullmatch(sender):
+        return False
+    return sender.lower() == expected.lower()
 
 
 def _reply_text(value: object) -> str | None:
     if not isinstance(value, str) or len(value) > _MAX_REPLY_TEXT or "\x00" in value:
         return None
-    if _has_secret(value):
-        return None
-    return value
-
-
-def _destination(origin: object, channel_id: str) -> ReplyOrigin | None:
-    platform = getattr(origin, "platform", None)
-    chat_id = getattr(origin, "chat_id", None)
-    session_key = getattr(origin, "session_key", None)
-    if not isinstance(platform, str) or _PLATFORM_RE.fullmatch(platform) is None:
-        return None
-    chat = _bounded(chat_id, _MAX_CHAT_ID)
-    session = _bounded(session_key, _MAX_SESSION_KEY)
-    if chat is None or session is None:
-        return None
-    if _targets_worker_dm(platform, chat, session, channel_id):
-        return None
-    return ReplyOrigin(platform=platform, chat_id=chat, session_key=session)
-
-
-def _targets_worker_dm(platform: str, chat_id: str, session_key: str, channel_id: str) -> bool:
-    channel = channel_id.casefold()
-    if platform == "buzz" and chat_id.casefold() == channel:
-        return True
-    return channel in [part.casefold() for part in session_key.split(":")]
-
-
-def _bounded(value: object, limit: int) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > limit:
-        return None
-    if any(ord(char) < 32 or char.isspace() for char in value):
-        return None
-    if _has_secret(value):
-        return None
-    return value
-
-
-def _has_secret(value: str) -> bool:
     lowered = value.lower()
-    return "nsec1" in lowered or "buzz_private_key" in lowered
+    if "nsec1" in lowered or "buzz_private_key" in lowered:
+        return None
+    return value
 
 
-def _wake(delegation_id: str, worker: str, inbound_text: str) -> str:
+def _wake(delegation_id: str, worker: str, task: str, inbound_text: str) -> str:
     return (
-        f"Pending delegation {delegation_id} from worker {worker}. "
-        "The original task text is not included. "
-        f"Inbound worker reply:\n{inbound_text}"
+        f"Worker result for delegation {delegation_id} ({worker}).\n"
+        "Original task:\n"
+        f"{task}\n\n"
+        "Inbound worker reply:\n"
+        f"{inbound_text}\n\n"
+        "Evaluate this result for the human. "
+        "A further instruction is a new delegate_worker call."
     )

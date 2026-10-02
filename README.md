@@ -11,13 +11,21 @@ read worker status, ensure one worker, and delegate a task over Buzz.
 
 `delegate_worker` returns when the relay accepts the signed event.
 `delivery` is `relay_accepted`. That is not worker execution and not
-task completion. A worker reply is evaluated in the originating human
-conversation and is not automatically acknowledged in the worker DM.
-`fleet_control.delegation_reply.plan_delegation_reply` is that decision.
-The originating session is not available to the MCP process, and the
-journal does not store it. Deployed Hermes
-`7817bf522af3caf54b30ae59f16157469d7638fc` does not call the planner, so
-that gateway still delivers its reply into the worker DM.
+task completion. Private Control-worker exchanges stay in the worker
+DM. The human receives the evaluated result in the originating
+conversation.
+
+The journal stores the task, the trusted origin, the worker identity,
+and the accepted event. `fleet-delegation-show <delegation_id>` prints
+that record. It is not a task viewer. The origin is copied from Hermes
+MCP `_meta["hermes.fleet.origin"]` for that one call. The model payload
+cannot set it, and it is not written into the worker message.
+`fleet-delegation-intake` is what the gateway runs on an inbound reply.
+Deployed Hermes `7817bf522af3caf54b30ae59f16157469d7638fc` does not call
+it, so that gateway still delivers its reply into the worker DM.
+[docs/delegation-roundtrip.md](docs/delegation-roundtrip.md) records the
+private-coordination decision, the Hermes change, and the deployment
+order.
 
 When Control reports that status to the human, it uses the worker's
 plain name (`operator`), not `@operator`, unless that worker is a
