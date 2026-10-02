@@ -35,6 +35,28 @@ channel, a public key, or a relay.
 The Buzz child receives only `PATH`, `BUZZ_PRIVATE_KEY`,
 `BUZZ_RELAY_URL`, an optional `BUZZ_AUTH_TAG`, and safe locale
 variables. The Fleet caller token stays in the Authorization header.
+That child `PATH` does not select the helper interpreter.
+
+## Helper runtime
+
+`delegate_worker` imports `cryptography`. Hermes's `python3` is not a
+stable place to import it: a Hermes update resolved `python3` to
+Python 3.14 without that package, and the tool returned
+`helper_failed`. Python 3.12 succeeded.
+
+Create the managed virtualenv with an explicit interpreter. The
+installer is standard library only. It does not install into the
+`PATH` interpreter and it refuses Hermes's agent virtualenv:
+
+```bash
+python3 install-control-runtime --python /usr/bin/python3.12
+```
+
+The MCP server execs `runtime/venv/bin/python` and passes the helper
+script as an argument. A missing interpreter is `helper_failed`, not a
+`PATH` search. Both upgrade breaks, and the inbound allowlist that
+this repository does not apply, are recorded in
+[docs/upgrade-breaks.md](docs/upgrade-breaks.md).
 
 ## Layout
 
@@ -48,7 +70,7 @@ redaction, and NIP-19 code those helpers need.
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
-cd fleet-mcp && npm ci --ignore-scripts && node --check index.js
+cd fleet-mcp && npm ci --ignore-scripts && node --check index.js && node --check python-bin.js && node --test python-bin.test.js
 ```
 
 Installing or restarting Control is a separate reviewed step. This

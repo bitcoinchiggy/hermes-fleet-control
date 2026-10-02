@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Create Control's managed helper virtualenv.
+
+This bootstrap is standard library only, so the ``python3`` that happens
+to be on ``PATH`` may start it. It does not load the cryptography
+package and it does not install packages into that interpreter. ``--python`` chooses
+the absolute interpreter that creates ``runtime/venv``. The delegation
+helpers then run inside that virtualenv.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fleet_control.runtime import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

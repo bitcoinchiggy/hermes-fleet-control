@@ -633,7 +633,11 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn("delegation_id", body)
 
     def test_delegate_script_boots(self):
-        env = {"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": self.tmp.name}
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin"),
+            "HOME": self.tmp.name,
+            "FLEET_CONTROL_PYTHON": sys.executable,
+        }
         proc = subprocess.run(
             [sys.executable, str(REPO / "fleet-delegate")],
             input=b'{"worker":"operator","task":"hello"}',
@@ -823,6 +827,12 @@ class McpSourceTests(unittest.TestCase):
         self.assertNotIn("BUZZ_PRIVATE_KEY=", text)
         self.assertNotIn("shell: true", text)
         self.assertIn("shell: false", text)
+        self.assertIn('from "./python-bin.js"', text)
+        self.assertIn("helperSpawnSpec(root, script, args, process.env)", text)
+        self.assertIn("spawn(spec.command, spec.args", text)
+        self.assertNotIn('spawn("python3"', text)
+        self.assertNotIn("spawn('python3'", text)
+        self.assertNotIn("env python3", text)
         input_schema = text.split('server.registerTool(\n  "delegate_worker",', 1)[1].split(
             "inputSchema:", 1
         )[1].split("async ({ worker, task, delegation_id }) => {", 1)[0]
@@ -843,13 +853,22 @@ class McpSourceTests(unittest.TestCase):
         self.assertIn("payload.delegation_id = delegation_id;", handler)
         self.assertNotIn("mention", handler)
         self.assertNotIn("--mention", text)
-        proc = subprocess.run(
-            ["node", "--check", str(REPO / "fleet-mcp" / "index.js")],
+        for name in ("index.js", "python-bin.js"):
+            proc = subprocess.run(
+                ["node", "--check", str(REPO / "fleet-mcp" / name)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        tested = subprocess.run(
+            ["node", "--test", str(REPO / "fleet-mcp" / "python-bin.test.js")],
             capture_output=True,
             text=True,
             check=False,
+            cwd=REPO / "fleet-mcp",
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(tested.returncode, 0, tested.stdout + tested.stderr)
 
     def _assert_reporting_rule(self, text: str) -> None:
         """The status-reply rule is the same in the skill and the tool description."""

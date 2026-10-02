@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { helperSpawnSpec } from "./python-bin.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -56,9 +57,13 @@ function forbiddenFailure() {
   });
 }
 
-function runHelper(bin, args, stdinText) {
+function runHelper(script, args, stdinText) {
   if (refusedEnvironment()) {
     return Promise.resolve(forbiddenFailure());
+  }
+  const spec = helperSpawnSpec(root, script, args, process.env);
+  if (!spec) {
+    return Promise.resolve(helperFailure());
   }
   return new Promise((resolve) => {
     let settled = false;
@@ -71,7 +76,7 @@ function runHelper(bin, args, stdinText) {
     };
     let child;
     try {
-      child = spawn(bin, args, {
+      child = spawn(spec.command, spec.args, {
         shell: false,
         env: helperEnv(),
         stdio: ["pipe", "pipe", "pipe"],
