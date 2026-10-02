@@ -44,14 +44,14 @@ from fleet_control.identity import (
     read_profile_env,
 )
 from fleet_control.journal import (
-    JOURNAL_DIR_KEY,
-    ensure_journal_dir,
     exclusive_delegation,
     fresh_record,
     read_record,
+    resolve_journal_dir,
     update_record,
     write_record,
 )
+from fleet_control.origin import read_trusted_origin, targets_worker_dm
 
 DELEGATION_ID_RE = re.compile(r"^dlg_[0-9a-f]{32}$")
 _REQUEST_KEYS = frozenset({"worker", "task", "delegation_id"})
@@ -109,7 +109,7 @@ def delegate_worker(
         refuse_forbidden_environment(env)
         profile = _profile_name(env)
         profiles_root = str(env.get(PROFILES_ROOT_KEY) or HERMES_PROFILES_DIR)
-        directory = _journal_directory(env, profile, profiles_root, journal_dir)
+        directory = resolve_journal_dir(env, journal_dir)
     except ControlError as exc:
         raise _with_delegation_id(exc, supplied_hint) from None
     delegation_id = supplied if supplied is not None else "dlg_" + secrets.token_hex(16)
@@ -164,6 +164,12 @@ def _with_lock(
     if record is not None and record["state"] == "ambiguous":
         raise fail("delegation_ambiguous")
 
+    origin = read_trusted_origin(env)
+    if origin is None:
+        raise fail("origin_unavailable")
+    if record is not None and _has_origin(record) and not _same_origin(record, origin):
+        raise fail("delegation_conflict")
+
     target = _target(worker, env, fleet_file_bytes, transport)
     if record is not None and record["worker_public_key_hex"] != target.public_key_hex:
         raise fail("delegation_conflict")
@@ -174,6 +180,20 @@ def _with_lock(
             worker_public_key_hex=target.public_key_hex,
             task_sha256=task_hash,
             state="bound",
+            task=task,
+            origin_platform=origin.platform,
+            origin_chat_id=origin.chat_id,
+            origin_session_key=origin.session_key,
+        )
+        write_record(directory, record)
+    elif not _has_origin(record):
+        record = update_record(
+            record,
+            task=task,
+            origin_platform=origin.platform,
+            origin_chat_id=origin.chat_id,
+            origin_session_key=origin.session_key,
+            reply_event_ids=[],
         )
         write_record(directory, record)
 
@@ -200,6 +220,9 @@ def _with_lock(
         if code != 0:
             raise fail("dm_open_failed")
         channel_id = parse_dm_open(stdout)
+        if targets_worker_dm(origin, channel_id):
+            write_record(directory, update_record(record, state="failed", channel_id=channel_id))
+            raise fail("origin_invalid")
     except ControlError as exc:
         if exc.code in ("dm_open_failed", "dm_open_malformed", "helper_failed"):
             write_record(directory, update_record(record, state="failed"))
@@ -291,6 +314,18 @@ def _same_work(record: dict[str, Any], worker: str, task_hash: str) -> bool:
     return record.get("worker") == worker and record.get("task_sha256") == task_hash
 
 
+def _has_origin(record: dict[str, Any]) -> bool:
+    return "origin_platform" in record
+
+
+def _same_origin(record: dict[str, Any], origin: Any) -> bool:
+    return (
+        record.get("origin_platform") == origin.platform
+        and record.get("origin_chat_id") == origin.chat_id
+        and record.get("origin_session_key") == origin.session_key
+    )
+
+
 def _receipt(delegation_id: str, worker: str, channel_id: str, event_id: str) -> dict[str, Any]:
     return {
         "accepted": True,
@@ -371,19 +406,3 @@ def main(argv: list[str] | None = None, stdin: Any = None) -> int:
     sys.stdout.write(public_json(body))
     return 0
 
-
-def _journal_directory(
-    env: dict[str, str],
-    profile: str,
-    profiles_root: str,
-    override: Path | None,
-) -> Path:
-    if override is not None:
-        return ensure_journal_dir(Path(override))
-    configured = str(env.get(JOURNAL_DIR_KEY) or "").strip()
-    if configured:
-        path = Path(configured)
-        if not path.is_absolute():
-            raise fail("journal_unusable")
-        return ensure_journal_dir(path)
-    return ensure_journal_dir(Path(profiles_root) / profile / "fleet-delegations")

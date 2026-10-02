@@ -32,6 +32,9 @@ MESSAGES = {
     "fleet_unauthorized": "fleet API rejected the caller",
     "fleet_response_unsafe": "fleet API response is unusable",
     "journal_unusable": "delegation journal is unusable",
+    "origin_unavailable": "originating conversation is unavailable",
+    "origin_invalid": "originating conversation is not a safe destination",
+    "delegation_not_found": "delegation record was not found",
     "helper_failed": "fleet helper failed",
     "internal_error": "delegation failed",
 }

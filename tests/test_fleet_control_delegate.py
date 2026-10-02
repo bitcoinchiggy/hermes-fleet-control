@@ -156,6 +156,9 @@ class DelegateTests(unittest.TestCase):
             "LANG": "C.UTF-8",
             "SECRET_PARENT": "parent-secret",
             "FLEET_PROVISIONER_CALLER_TOKEN": "test-caller-token",
+            "FLEET_CONTROL_ORIGIN_PLATFORM": "telegram",
+            "FLEET_CONTROL_ORIGIN_CHAT_ID": "424242",
+            "FLEET_CONTROL_ORIGIN_SESSION_KEY": "agent:main:telegram:dm:424242",
         }
 
     def tearDown(self):
@@ -540,8 +543,13 @@ class DelegateTests(unittest.TestCase):
         blob = record.read_text()
         stored = json.loads(blob)
         self.assertEqual(stored["state"], "accepted")
-        self.assertNotIn("task", stored)
-        self.assertNotIn(TASK, blob)
+        self.assertEqual(stored["task"], TASK)
+        self.assertEqual(stored["origin_platform"], "telegram")
+        self.assertEqual(stored["origin_chat_id"], "424242")
+        self.assertEqual(stored["origin_session_key"], "agent:main:telegram:dm:424242")
+        self.assertEqual(stored["worker_public_key_hex"], WORKER_HEX)
+        self.assertEqual(stored["reply_event_ids"], [])
+        self.assertIn(TASK, blob)
         assert_absent(blob, CONTROL_NSEC)
         assert_absent(blob, "test-caller-token")
         assert_absent(json.dumps(result), CONTROL_NSEC)
@@ -680,6 +688,8 @@ class DelegateTests(unittest.TestCase):
         )
         self.assertEqual(sent["argv"].count("--mention"), 1)
         self.assertTrue(sent["stdin"].decode().startswith(f"[fleet-delegation {delegation_id}]\n"))
+        self.assertNotIn("424242", sent["stdin"].decode())
+        self.assertNotIn("agent:main:telegram:dm:424242", sent["stdin"].decode())
         self.assertNotIn(TASK, sent["argv"])
         self.assertNotIn("SECRET_PARENT", opened["env"])
         self.assertNotIn("FLEET_PROVISIONER_CALLER_TOKEN", opened["env"])
@@ -695,7 +705,8 @@ class DelegateTests(unittest.TestCase):
         blob = (self.journal / f"{delegation_id}.json").read_text()
         assert_absent(blob, CONTROL_NSEC)
         assert_absent(blob, WORKER_SECRET.hex())
-        self.assertNotIn(TASK, blob)
+        self.assertIn(TASK, blob)
+        self.assertIn("424242", blob)
 
     def _only_record(self) -> Path:
         records = list(self.journal.glob("dlg_*.json"))
@@ -846,7 +857,7 @@ class McpSourceTests(unittest.TestCase):
         self.assertNotIn("env python3", text)
         input_schema = text.split('server.registerTool(\n  "delegate_worker",', 1)[1].split(
             "inputSchema:", 1
-        )[1].split("async ({ worker, task, delegation_id }) => {", 1)[0]
+        )[1].split("async ({ worker, task, delegation_id }, extra) => {", 1)[0]
         self.assertNotIn("mention", input_schema)
         self.assertNotIn("pubkey", input_schema)
         self.assertNotIn("channel", input_schema)
@@ -857,14 +868,17 @@ class McpSourceTests(unittest.TestCase):
         readme = (REPO / "README.md").read_text()
         self.assertIn("skills/fleet-delegation/SKILL.md", readme)
         self.assertIn("plain name (`operator`), not `@operator`", readme)
-        handler = text.split("async ({ worker, task, delegation_id }) => {", 1)[1].split(
-            "return textResult", 1
+        handler = text.split("async ({ worker, task, delegation_id }, extra) => {", 1)[1].split(
+            "\n);\n", 1
         )[0]
         self.assertIn("const payload = { worker, task };", handler)
         self.assertIn("payload.delegation_id = delegation_id;", handler)
+        self.assertIn("originEnvFromMeta(extra && extra._meta)", handler)
+        self.assertNotIn("chat_id", handler)
+        self.assertNotIn("session_key", handler)
         self.assertNotIn("mention", handler)
         self.assertNotIn("--mention", text)
-        for name in ("index.js", "python-bin.js"):
+        for name in ("index.js", "python-bin.js", "origin-env.js"):
             proc = subprocess.run(
                 ["node", "--check", str(REPO / "fleet-mcp" / name)],
                 capture_output=True,
@@ -873,7 +887,12 @@ class McpSourceTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
         tested = subprocess.run(
-            ["node", "--test", str(REPO / "fleet-mcp" / "python-bin.test.js")],
+            [
+                "node",
+                "--test",
+                str(REPO / "fleet-mcp" / "python-bin.test.js"),
+                str(REPO / "fleet-mcp" / "origin-env.test.js"),
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -894,6 +913,7 @@ class McpSourceTests(unittest.TestCase):
             "Write: Delegated to operator — relay accepted.",
             "Do not write: Delegated to @operator — relay accepted.",
             "A worker reply is evaluated in the originating human conversation and is not automatically acknowledged in the worker DM. A further instruction is a new delegate_worker call.",
+            "Private Control-worker exchanges stay in the worker DM, and the human receives the evaluated result in the originating conversation.",
         )
         for sentence in required:
             self.assertIn(sentence, text)
