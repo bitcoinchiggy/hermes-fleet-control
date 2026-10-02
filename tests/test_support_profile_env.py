@@ -40,8 +40,6 @@ class ProfileEnvTests(unittest.TestCase):
             os.chmod(profile / ".env", 0o600)
             with open_named_profile("control", profiles_root=root) as opened:
                 self.assertEqual(opened.read_env(), payload)
-                writers = [name for name in dir(opened) if "replace" in name or name.startswith("atomic")]
-                self.assertEqual(writers, [])
             empty = root / "other"
             empty.mkdir()
             with open_named_profile("other", profiles_root=root) as opened:
@@ -75,12 +73,23 @@ class ProfileEnvTests(unittest.TestCase):
                 open_named_profile("missing", profiles_root=tmp)
             self.assertEqual(caught.exception.public_message, ERR_PROFILE_NOT_FOUND)
 
-    def test_module_has_no_writer(self):
+    def test_delegation_modules_do_not_replace_the_profile(self):
+        root = Path(__file__).resolve().parents[1]
+        for rel in (
+            "fleet_control/delegate.py",
+            "fleet_control/identity.py",
+            "fleet_control/status.py",
+            "fleet_control/ensure.py",
+        ):
+            text = (root / rel).read_text()
+            self.assertNotIn("atomic_" + "replace_env", text, rel)
+
+    def test_module_writer_is_the_pinned_replace(self):
         source = (
             Path(__file__).resolve().parents[1] / "fleet_control" / "support" / "profile_env.py"
         ).read_text()
-        self.assertNotIn("os.replace", source)
-        self.assertNotIn("O_WRONLY", source)
+        self.assertEqual(source.count("os.replace("), 1)
+        self.assertIn("O_NOFOLLOW", source)
 
 
 if __name__ == "__main__":

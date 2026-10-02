@@ -43,6 +43,7 @@ RUNTIME_MODULES = (
     "fleet_control.errors",
     "fleet_control.http",
     "fleet_control.identity",
+    "fleet_control.inbound_allow",
     "fleet_control.journal",
     "fleet_control.output",
     "fleet_control.runtime",
@@ -94,7 +95,7 @@ class PublicationBoundaryTests(unittest.TestCase):
         self.assertFalse(any(name == identity_pkg or name.startswith(identity_pkg + ".") for name in loaded))
 
     def test_helpers_insert_only_the_clone_root(self):
-        for name in ("fleet-status", "fleet-ensure", "fleet-delegate", "install-control-runtime"):
+        for name in ("fleet-status", "fleet-ensure", "fleet-delegate", "fleet-allow-inbound", "install-control-runtime"):
             path = ROOT / name
             text = path.read_text()
             mode = stat.S_IMODE(path.stat().st_mode)

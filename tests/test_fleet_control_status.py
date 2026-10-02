@@ -95,19 +95,31 @@ class FleetStatusTests(unittest.TestCase):
         self.assertEqual(json.loads("".join(code_out))["error"]["code"], "invalid_name")
 
     def test_script_boots_and_refuses_a_missing_env_file(self):
-        env = {
-            "PATH": os.environ.get("PATH", "/usr/bin"),
-            "HOME": "/tmp",
-            "FLEET_CONTROL_PYTHON": sys.executable,
-        }
-        proc = subprocess.run(
-            [sys.executable, str(REPO / "fleet-status")],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(proc.returncode, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            venv = Path(tmp) / "boot-venv"
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+                check=True,
+                capture_output=True,
+            )
+            python = venv / "bin" / "python"
+            real = os.path.realpath(sys.executable)
+            if os.path.realpath(python) != real:
+                python.unlink()
+                python.symlink_to(real)
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin"),
+                "HOME": "/tmp",
+                "FLEET_CONTROL_PYTHON": str(python),
+            }
+            proc = subprocess.run(
+                [sys.executable, str(REPO / "fleet-status")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["error"]["code"], "invalid_control_env")
         self.assertEqual(proc.stderr, "")
 
@@ -121,19 +133,31 @@ class FleetEnsureTests(unittest.TestCase):
         self.assertEqual((method, url, payload), ("PUT", "https://fleet.example/v1/workers/operator/ensure", b"{}"))
 
     def test_script_boots(self):
-        env = {
-            "PATH": os.environ.get("PATH", "/usr/bin"),
-            "HOME": "/tmp",
-            "FLEET_CONTROL_PYTHON": sys.executable,
-        }
-        proc = subprocess.run(
-            [sys.executable, str(REPO / "fleet-ensure"), "operator"],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(proc.returncode, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            venv = Path(tmp) / "boot-venv"
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+                check=True,
+                capture_output=True,
+            )
+            python = venv / "bin" / "python"
+            real = os.path.realpath(sys.executable)
+            if os.path.realpath(python) != real:
+                python.unlink()
+                python.symlink_to(real)
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin"),
+                "HOME": "/tmp",
+                "FLEET_CONTROL_PYTHON": str(python),
+            }
+            proc = subprocess.run(
+                [sys.executable, str(REPO / "fleet-ensure"), "operator"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["error"]["code"], "invalid_control_env")
 
 

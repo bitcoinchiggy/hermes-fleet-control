@@ -4,9 +4,9 @@ A Hermes update can put another ``python3`` first on ``PATH``. The
 delegation helpers import ``cryptography``. Resolving ``python3`` from
 that ``PATH`` is not reproducible. A reviewed install creates
 ``runtime/venv`` from an absolute interpreter and this checkout's
-``requirements.txt``. The MCP launcher then execs that virtualenv's
-Python and passes the helper script as an argument, so the shebang is
-not the interpreter selection.
+hashed ``requirements.lock`` (direct pins and transitives). The MCP
+launcher then execs that virtualenv's Python and passes the helper
+script as an argument, so the shebang is not the interpreter selection.
 
 ``FLEET_CONTROL_PYTHON``, when set, must be an absolute path. It must
 not be Hermes's agent virtualenv. There is no ``PATH`` fallback.
@@ -45,7 +45,7 @@ class RuntimePlanError(ValueError):
 
 
 def checkout_root() -> Path:
-    """Directory that contains ``fleet_control`` and ``requirements.txt``."""
+    """Directory that contains ``fleet_control`` and ``requirements.lock``."""
     return Path(__file__).resolve().parents[1]
 
 
@@ -79,6 +79,33 @@ def managed_python(root: str | Path) -> str:
     return str(Path(root).resolve().joinpath(*MANAGED_RELATIVE))
 
 
+def intended_venv_prefix(interpreter: str) -> str:
+    """Virtualenv root that owns ``interpreter``, without resolving the binary.
+
+    ``bin/python`` is frequently a symlink to the system interpreter.
+    Resolving that symlink yields the system prefix, not the virtualenv.
+    """
+    binary = os.path.abspath(interpreter)
+    return os.path.normpath(os.path.join(os.path.dirname(binary), os.pardir))
+
+
+def running_intended_environment(interpreter: str) -> bool:
+    """True when this process is the virtualenv that owns ``interpreter``.
+
+    ``realpath(sys.executable)`` does not establish membership. A virtualenv
+    Python and the system Python often resolve to the same binary, while
+    ``sys.prefix`` still names the virtualenv and ``sys.base_prefix`` names
+    the interpreter the virtualenv was created from.
+    """
+    prefix = intended_venv_prefix(interpreter)
+    if not os.path.isfile(os.path.join(prefix, "pyvenv.cfg")):
+        return False
+    if os.path.realpath(sys.prefix) == os.path.realpath(sys.base_prefix):
+        return False
+    # Resolve directory links only. Never compare ``realpath(sys.executable)``.
+    return os.path.realpath(sys.prefix) == os.path.realpath(prefix)
+
+
 def resolve_helper_python(root: str | Path, environ: dict[str, str]) -> str:
     """Interpreter the helpers and the MCP launcher must exec.
 
@@ -107,8 +134,10 @@ def reexec_managed_python() -> None:
         _unavailable()
     if not os.path.isfile(target) or not os.access(target, os.X_OK):
         _unavailable()
-    if os.path.realpath(sys.executable) == os.path.realpath(target):
+    if running_intended_environment(target):
         return
+    if not os.path.isfile(os.path.join(intended_venv_prefix(target), "pyvenv.cfg")):
+        _unavailable()
     try:
         os.execv(target, [target, *sys.argv])
     except OSError:
@@ -133,15 +162,16 @@ class RuntimeInstallPlan:
 
 
 def plan_runtime_install(interpreter: object, root: str | Path) -> RuntimeInstallPlan:
-    """Plan a virtualenv from an explicit interpreter and ``requirements.txt``.
+    """Plan a virtualenv from an explicit interpreter and ``requirements.lock``.
 
     Does not create the virtualenv and does not install packages.
+    The lock pins direct and transitive dependencies by hash.
     """
     binary = validate_interpreter(interpreter)
     checkout = Path(root).resolve()
     venv_dir = checkout / "runtime" / "venv"
     venv_python = venv_dir / "bin" / "python"
-    requirements = checkout / "requirements.txt"
+    requirements = checkout / "requirements.lock"
     if _inside_hermes_agent_venv(str(venv_dir)) or _inside_hermes_agent_venv(str(venv_python)):
         raise RuntimePlanError("refusing Hermes agent virtualenv")
     return RuntimeInstallPlan(
@@ -156,6 +186,8 @@ def plan_runtime_install(interpreter: object, root: str | Path) -> RuntimeInstal
             "pip",
             "install",
             "--require-virtualenv",
+            "--require-hashes",
+            "--only-binary=:all:",
             "-r",
             str(requirements),
         ),
@@ -168,7 +200,7 @@ def execute_runtime_install(plan: RuntimeInstallPlan, runner: Runner | None = No
         raise RuntimePlanError("interpreter is not executable")
     validate_interpreter(plan.interpreter)
     if not os.path.isfile(plan.requirements):
-        raise RuntimePlanError("requirements.txt is missing")
+        raise RuntimePlanError("requirements.lock is missing")
 
     def _run(argv: Sequence[str]) -> None:
         if runner is not None:

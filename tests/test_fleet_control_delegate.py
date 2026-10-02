@@ -633,10 +633,21 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn("delegation_id", body)
 
     def test_delegate_script_boots(self):
+        venv = Path(self.tmp.name) / "boot-venv"
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+            check=True,
+            capture_output=True,
+        )
+        python = venv / "bin" / "python"
+        real = os.path.realpath(sys.executable)
+        if os.path.realpath(python) != real:
+            python.unlink()
+            python.symlink_to(real)
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin"),
             "HOME": self.tmp.name,
-            "FLEET_CONTROL_PYTHON": sys.executable,
+            "FLEET_CONTROL_PYTHON": str(python),
         }
         proc = subprocess.run(
             [sys.executable, str(REPO / "fleet-delegate")],

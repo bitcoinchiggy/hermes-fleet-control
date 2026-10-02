@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Preserve Control's authorized humans and add verified worker public keys."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fleet_control.runtime import reexec_managed_python
+
+reexec_managed_python()
+
+from fleet_control.inbound_allow import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

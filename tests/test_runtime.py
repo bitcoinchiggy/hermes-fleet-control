@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import json
 import sys
 import tempfile
 import unittest
@@ -42,7 +43,7 @@ class RuntimePlanTests(unittest.TestCase):
     def test_plan_uses_the_explicit_interpreter_and_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "requirements.txt").write_text("cryptography>=41.0.7\n")
+            (root / "requirements.lock").write_text("cryptography==50.0.2\n")
             plan = plan_runtime_install("/usr/bin/python3.12", root)
         self.assertEqual(plan.interpreter, "/usr/bin/python3.12")
         self.assertEqual(plan.create_argv, ("/usr/bin/python3.12", "-m", "venv", plan.venv_dir))
@@ -55,6 +56,8 @@ class RuntimePlanTests(unittest.TestCase):
                 "pip",
                 "install",
                 "--require-virtualenv",
+                "--require-hashes",
+                "--only-binary=:all:",
                 "-r",
                 plan.requirements,
             ),
@@ -82,7 +85,7 @@ class RuntimePlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "checkout"
             root.mkdir()
-            (root / "requirements.txt").write_text("cryptography>=41.0.7\n")
+            (root / "requirements.lock").write_text("cryptography==50.0.2\n")
             interpreter = Path(tmp) / "python3.12"
             interpreter.write_text("#!/bin/sh\nexit 0\n")
             interpreter.chmod(0o755)
@@ -103,7 +106,8 @@ class RuntimePlanTests(unittest.TestCase):
         self.assertEqual(calls[0][1:3], ["-m", "venv"])
         self.assertEqual(calls[1][0], plan.venv_python)
         self.assertIn("--require-virtualenv", calls[1])
-        self.assertIn(str(root / "requirements.txt"), calls[1])
+        self.assertIn("--require-hashes", calls[1])
+        self.assertIn(str(root / "requirements.lock"), calls[1])
         self.assertNotIn("apt-get", " ".join(calls[0] + calls[1]))
 
     def test_symlink_into_the_agent_venv_is_rejected(self) -> None:
@@ -120,13 +124,14 @@ class HelperBootstrapTests(unittest.TestCase):
             "fleet-status": "fleet_control.status",
             "fleet-ensure": "fleet_control.ensure",
             "fleet-delegate": "fleet_control.delegate",
+            "fleet-allow-inbound": "fleet_control.inbound_allow",
         }
         for name, module in mains.items():
             text = (ROOT / name).read_text()
             self.assertLess(text.index("reexec_managed_python()"), text.index(f"from {module} import main"))
             self.assertEqual(text.count("sys.path.insert"), 1, name)
 
-    def test_direct_helper_does_not_stay_on_path_python(self) -> None:
+    def test_non_venv_override_does_not_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             wrapper = Path(tmp) / "managed-python"
             wrapper.write_text("#!/bin/sh\necho REEXEC\n")
@@ -142,9 +147,9 @@ class HelperBootstrapTests(unittest.TestCase):
                 text=True,
                 check=False,
             )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "REEXEC")
-        self.assertNotIn("cryptography", proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("managed python is unavailable", proc.stderr)
+        self.assertNotIn("REEXEC", proc.stdout)
         self.assertNotIn("ModuleNotFoundError", proc.stderr)
 
     def test_missing_managed_python_fails_before_cryptography(self) -> None:
@@ -171,6 +176,97 @@ class HelperBootstrapTests(unittest.TestCase):
         self.assertIn("from fleet_control.runtime import main", text)
         self.assertNotIn("reexec_managed_python", text)
         self.assertNotIn("import cryptography", text)
+
+    def test_lock_pins_direct_and_transitive_hashes(self) -> None:
+        text = (ROOT / "requirements.lock").read_text()
+        for pin in ("cryptography==50.0.2", "cffi==2.1.1", "pycparser==3.0"):
+            self.assertIn(pin, text)
+        self.assertGreaterEqual(text.count("--hash=sha256:"), 3)
+        self.assertNotIn(">=", text)
+
+    def test_reexec_enters_venv_when_realpath_matches_system_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            venv = base / "venv"
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+                check=True,
+                capture_output=True,
+            )
+            python = venv / "bin" / "python"
+            real = os.path.realpath(sys.executable)
+            python.unlink()
+            python.symlink_to(real)
+            self.assertEqual(os.path.realpath(python), real)
+            self.assertNotEqual(os.path.normpath(sys.prefix), os.path.normpath(str(venv)))
+            hermes = base / "hermes-bin"
+            hermes.mkdir()
+            wrapper = hermes / "python3"
+            wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} -S \"$@\"\n")
+            wrapper.chmod(0o755)
+            probe = base / "probe.py"
+            probe.write_text(
+                "import sys\n"
+                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                "from fleet_control.runtime import reexec_managed_python\n"
+                "reexec_managed_python()\n"
+                "print(sys.prefix)\n"
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{hermes}{os.pathsep}/usr/bin{os.pathsep}/bin"
+            env["FLEET_CONTROL_PYTHON"] = str(python)
+            env.pop("PYTHONPATH", None)
+            proc = subprocess.run(
+                ["/usr/bin/env", "python3", str(probe)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(os.path.normpath(proc.stdout.strip()), os.path.normpath(str(venv)))
+
+    def test_clean_install_imports_delegation_under_conflicting_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "checkout"
+            root.mkdir()
+            (root / "requirements.lock").write_text((ROOT / "requirements.lock").read_text())
+            plan = plan_runtime_install(sys.executable, root)
+            execute_runtime_install(plan)
+            python = Path(plan.venv_python)
+            real = os.path.realpath(sys.executable)
+            python.unlink()
+            python.symlink_to(real)
+            self.assertEqual(os.path.realpath(python), real)
+            hermes = Path(tmp) / "hermes-bin"
+            hermes.mkdir()
+            wrapper = hermes / "python3"
+            wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} -S \"$@\"\n")
+            wrapper.chmod(0o755)
+            blocked = subprocess.run(
+                [str(wrapper), "-c", "import cryptography"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+            env = os.environ.copy()
+            env["PATH"] = f"{hermes}{os.pathsep}/usr/bin{os.pathsep}/bin"
+            env["FLEET_CONTROL_PYTHON"] = str(python)
+            env.pop("PYTHONPATH", None)
+            env.pop("BUZZ_PRIVATE_KEY", None)
+            proc = subprocess.run(
+                ["/usr/bin/env", "python3", str(ROOT / "fleet-delegate")],
+                input=b'{"worker":"operator","task":"hello"}',
+                env=env,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(proc.returncode, 1, proc.stderr.decode())
+        self.assertNotIn(b"ModuleNotFoundError", proc.stderr)
+        self.assertNotIn(b"cryptography", proc.stderr)
+        body = json.loads(proc.stdout)
+        self.assertEqual(body["error"]["code"], "control_profile_unusable")
 
 
 if __name__ == "__main__":
