@@ -105,22 +105,35 @@ message keeps the existing dispatch. `kind` `delegation_reply` suppresses
 the worker DM. A helper failure is neither of those answers. A missing
 binary, timeout, non-zero exit, or unusable output means the correlation
 service is unavailable. Reply-parent messages on this integration are
-held in `unavailable-holds/` and are not dispatched, reacted to, or
-given a worker error. Top-level messages, and every gateway that does
-not set `HERMES_FLEET_CONTROL_INTEGRATION=1`, keep their normal path.
-When intake is available again, a held reply is classified: a positive
-unrelated reply is dispatched then, and a correlated reply resumes the
-human session once. If the hold file cannot be written, the message is
-still not dispatched in this process; recovery then depends on the
-relay presenting that event again. Holds are capped at 64 files.
+held and are not dispatched, reacted to, or given a worker error.
+The hold directory is the helper journal directory, not the checkout:
 
-The patch adds `gateway/fleet_delegation.py` and two anchored call
-sites, marked `FLEET_DELEGATION_META` and `FLEET_DELEGATION_HANDOFF`.
-A Hermes update that replaces those files drops the call sites. Reapply
-the patch onto the pinned commit, or replay the two hunks if the
-anchors still match. `patches/hermes-delegation-handoff/check-anchors.py`
-fails when either anchor is missing. Do not start the operator gateway
-on a tree where the check fails.
+- absolute `FLEET_DELEGATION_JOURNAL_DIR`: `<that directory>/unavailable-holds`
+- otherwise: `<FLEET_CONTROL_PROFILES_ROOT or /home/hermes/.hermes/profiles>/<FLEET_CONTROL_HERMES_PROFILE>/fleet-delegations/unavailable-holds`
+
+`HERMES_FLEET_CONTROL_ROOT` is only the directory that contains
+`fleet-delegation-intake`. A root-owned checkout at
+`/opt/hermes-fleet-control/<sha>` does not need a new owner. Top-level
+messages, and every gateway that does not set
+`HERMES_FLEET_CONTROL_INTEGRATION=1`, keep their normal path. Gateway
+startup runs recovery immediately, then again every
+`HERMES_FLEET_DELEGATION_RECOVERY_INTERVAL` seconds (default 30, clamped
+to 0.05..300) until shutdown awaits the loop. A recovery pass already
+in flight is not overlapped by the next tick or by another inbound
+event. When intake is available again, a held reply is classified: a
+positive unrelated reply is dispatched then, and a correlated reply
+resumes the human session once. If the hold file cannot be written, the
+message is still not dispatched in this process; recovery then depends
+on the relay presenting that event again. Holds are capped at 64 files.
+
+The patch adds `gateway/fleet_delegation.py` and anchored call sites,
+marked `FLEET_DELEGATION_META`, `FLEET_DELEGATION_HANDOFF`, and
+`FLEET_DELEGATION_RECOVERY` in gateway startup and shutdown. A Hermes
+update that replaces those files drops the call sites. Reapply the
+patch onto the pinned commit, or replay the hunks if the anchors still
+match. `patches/hermes-delegation-handoff/check-anchors.py` fails when
+an anchor is missing. Do not start the operator gateway on a tree where
+the check fails.
 
 ## Deployment order
 
