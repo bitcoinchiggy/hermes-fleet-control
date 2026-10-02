@@ -9,8 +9,10 @@ allowlist command replaces the file, and it must keep ``BUZZ_PRIVATE_KEY``.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import stat
+from collections.abc import Sequence
 from pathlib import Path
 
 from fleet_control.support.names import NAME_RE
@@ -25,6 +27,7 @@ ERR_SECRET_WRITE_FAILED = "secret write failed"
 
 ENV_FILENAME = ".env"
 MAX_ENV_BYTES = 1024 * 1024
+_RELATIVE_PART = re.compile(r"^[A-Za-z0-9._-]+\Z")
 _TMP_PREFIX = ".hf-env-"
 _TMP_SUFFIX = ".tmp"
 _TMP_ATTEMPTS = 16
@@ -76,6 +79,16 @@ class OpenedHermesProfile:
         """Return ``.env`` bytes. Caller must not log or print them."""
         self._require_open()
         return _read_existing_env(self._profile_fd)
+
+    def read_relative(self, parts: Sequence[str]) -> bytes | None:
+        """Read one regular file under this profile. Missing is ``None``.
+
+        Each path component is opened with ``O_NOFOLLOW``. A symlink or a
+        non-regular file fails closed. The bytes can contain secrets; callers
+        must not print them.
+        """
+        self._require_open()
+        return _read_relative(self._profile_fd, parts)
 
     def replace_env(self, new_bytes: bytes) -> None:
         """Replace ``.env`` via a same-directory temp file and ``os.replace``."""
@@ -243,6 +256,112 @@ def _read_existing_env(profile_fd: int) -> bytes:
     if not utf8_ok:
         raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
     return data
+
+
+def _relative_part(part: object) -> str:
+    if not isinstance(part, str) or not _RELATIVE_PART.fullmatch(part) or part in {".", ".."}:
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    return part
+
+
+def _open_child_dir(dir_fd: int, name: str) -> int | None:
+    """Open a subdirectory, or ``None`` when it is absent. Symlinks fail closed."""
+    flags = _open_flags(os.O_RDONLY, os.O_DIRECTORY)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
+    missing = False
+    unsafe = False
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        missing = True
+    except OSError:
+        unsafe = True
+    if missing:
+        return None
+    if unsafe or fd is None:
+        _close_fd(fd)
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        _close_fd(fd)
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    return fd
+
+
+def _read_regular_in(dir_fd: int, name: str) -> bytes | None:
+    flags = _open_flags(os.O_RDONLY)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd: int | None = None
+    missing = False
+    unsafe = False
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        missing = True
+    except OSError:
+        unsafe = True
+    if missing:
+        return None
+    if unsafe or fd is None:
+        _close_fd(fd)
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    data: bytes | None = None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            unsafe = True
+        else:
+            chunks = bytearray()
+            too_big = False
+            while True:
+                piece = os.read(fd, 8192)
+                if not piece:
+                    break
+                chunks.extend(piece)
+                if len(chunks) > MAX_ENV_BYTES:
+                    too_big = True
+                    break
+            if too_big:
+                unsafe = True
+            else:
+                data = bytes(chunks)
+    except Exception:
+        unsafe = True
+        data = None
+    finally:
+        _close_fd(fd)
+    if unsafe or data is None:
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    if b"\x00" in data:
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET) from None
+    return data
+
+
+def _read_relative(root_fd: int, parts: Sequence[str]) -> bytes | None:
+    if not isinstance(parts, Sequence) or isinstance(parts, (str, bytes)) or not parts:
+        raise ProfileEnvError(ERR_UNSAFE_ENV_TARGET)
+    owned: list[int] = []
+    dir_fd = root_fd
+    try:
+        for part in parts[:-1]:
+            child = _open_child_dir(dir_fd, _relative_part(part))
+            if child is None:
+                return None
+            owned.append(child)
+            dir_fd = child
+        return _read_regular_in(dir_fd, _relative_part(parts[-1]))
+    finally:
+        for fd in reversed(owned):
+            _close_fd(fd)
 
 
 def _create_exclusive_temp(profile_fd: int) -> tuple[int, str]:

@@ -1,5 +1,5 @@
 # Reviewed lock for the Control helper virtualenv.
-# Direct: cryptography. Transitive: cffi, pycparser.
+# Direct: cryptography, PyYAML. Transitive: cffi, pycparser.
 # Wheels only (CPython 3.12, manylinux x86_64 and aarch64, plus pure-Python).
 # Install with: python -m pip install --require-virtualenv --require-hashes --only-binary=:all: -r requirements.lock
 
@@ -33,4 +33,8 @@ cffi==2.1.1 \
 
 pycparser==3.0 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+
+PyYAML==6.0.2 \
+    --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+    --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
 
