@@ -41,6 +41,7 @@ RUNTIME_MODULES = (
     "fleet_control.delegate",
     "fleet_control.ensure",
     "fleet_control.errors",
+    "fleet_control.hermes_authz",
     "fleet_control.http",
     "fleet_control.identity",
     "fleet_control.inbound_allow",

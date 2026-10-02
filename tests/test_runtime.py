@@ -179,7 +179,7 @@ class HelperBootstrapTests(unittest.TestCase):
 
     def test_lock_pins_direct_and_transitive_hashes(self) -> None:
         text = (ROOT / "requirements.lock").read_text()
-        for pin in ("cryptography==50.0.2", "cffi==2.1.1", "pycparser==3.0"):
+        for pin in ("cryptography==50.0.2", "cffi==2.1.1", "pycparser==3.0", "PyYAML==6.0.2"):
             self.assertIn(pin, text)
         self.assertGreaterEqual(text.count("--hash=sha256:"), 3)
         self.assertNotIn(">=", text)

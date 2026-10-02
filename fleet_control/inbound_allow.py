@@ -1,9 +1,11 @@
 """Apply Control's inbound Buzz allowlist on the active profile.
 
-Reads the selected profile ``.env`` and appends verified ``operator`` and
-``researcher`` public keys to the keys already authorized there. Extra
-human keys stay. ``allow_all_users`` stays false. ``BUZZ_PRIVATE_KEY`` is
-preserved and is not part of the public result.
+Reads the selected profile and appends verified ``operator`` and
+``researcher`` public keys to the humans Hermes already authorizes.
+``BUZZ_ALLOWED_USERS`` may be absent. Pairing approvals and ``config.yaml``
+are part of that set. An absent ``BUZZ_ALLOW_ALL_USERS`` is Hermes's
+default, false. ``BUZZ_PRIVATE_KEY`` is preserved and is not part of the
+public result.
 
 This command does not import a worker key-derivation package, does not
 read worker private keys, does not accept provisioner administration
@@ -22,10 +24,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from fleet_control.config import FORBIDDEN_ENV_KEYS, refuse_forbidden_environment
+from fleet_control.hermes_authz import HermesAuthzError, effective_buzz_authorization
 from fleet_control.support.envfile import EnvFileError, env_assignment_values
 from fleet_control.support.nostr_codec import InvalidNostrKeyError, decode_npub
 from fleet_control.support.profile_env import (
     HERMES_PROFILES_DIR,
+    OpenedHermesProfile,
     ProfileEnvError,
     open_named_profile,
     validate_profile_name,
@@ -36,6 +40,7 @@ INBOUND_WORKERS = ("operator", "researcher")
 LEGACY_GENERIC_UNIT = "hermes-gateway.service"
 PROFILE_KEY = "FLEET_CONTROL_HERMES_PROFILE"
 PROFILES_ROOT_KEY = "FLEET_CONTROL_PROFILES_ROOT"
+DIAGNOSE_KEY = "FLEET_CONTROL_INBOUND_DIAGNOSE"
 _UNIT_RE = re.compile(r"^hermes-gateway-(?P<profile>.+)\.service\Z")
 _SECRET_RE = re.compile("nsec1|sk-|" + "xp" + "rv", re.IGNORECASE)
 _SECRET_KEYS = frozenset(
@@ -191,14 +196,14 @@ def verified_worker_hexes(documents: Sequence[object]) -> tuple[str, str]:
     return ordered
 
 
-def current_allowed_users(raw: bytes) -> tuple[str, ...]:
-    """Public keys already authorized on this profile. Does not return secrets."""
+def _written_allowed_users(raw: bytes) -> tuple[str, ...]:
+    """Public keys on the env allowlist after a write. Does not return secrets."""
     try:
         allow_values = env_assignment_values(raw, _ALLOW_ALL)
         user_values = env_assignment_values(raw, _ALLOWED_USERS)
     except EnvFileError:
         raise InboundAllowError("control allowlist is unusable") from None
-    if len(allow_values) != 1 or _unquote(allow_values[0]).lower() != "false":
+    if len(allow_values) != 1 or _unquote(allow_values[0]).strip().lower() in {"true", "1", "yes"}:
         raise InboundAllowError("allow_all_users is not a control authorization")
     if len(user_values) != 1:
         raise InboundAllowError("control allowlist is unusable")
@@ -231,8 +236,6 @@ def merge_allowed_users(existing: Sequence[str], worker_hexes: Sequence[str]) ->
             continue
         seen.add(hex_key)
         merged.append(hex_key)
-    if not merged:
-        raise InboundAllowError("control allowlist is unusable")
     for item in worker_hexes:
         hex_key = _public_hex(item, "worker public key")
         if hex_key in seen:
@@ -249,19 +252,19 @@ def _private_values(raw: bytes) -> list[str]:
         raise InboundAllowError("control profile is unusable") from None
 
 
-def _replace_allowed_users(existing: bytes, users: str) -> bytes:
-    if not _ASSIGNMENT_RE.fullmatch(_ALLOWED_USERS):
+def _upsert_assignment(existing: bytes, key: str, value: str) -> bytes:
+    if not _ASSIGNMENT_RE.fullmatch(key):
         raise InboundAllowError("control allowlist is unusable")
-    if not users or any(ch in users for ch in ("\n", "\r", "\x00")):
+    if not value or any(ch in value for ch in ("\n", "\r", "\x00")):
         raise InboundAllowError("control allowlist is unusable")
-    if _SECRET_RE.search(users) or _PRIVATE_KEY in users:
+    if _SECRET_RE.search(value) or _PRIVATE_KEY in value:
         raise InboundAllowError("refusing secret material")
     try:
         text = bytes(existing).decode("utf-8")
     except UnicodeDecodeError:
         raise InboundAllowError("control profile is unusable") from None
-    assignment = f"{_ALLOWED_USERS}={users}"
-    match = re.compile(rf"^(?:export\s+)?{re.escape(_ALLOWED_USERS)}\s*=")
+    assignment = f"{key}={value}"
+    match = re.compile(rf"^(?:export\s+)?{re.escape(key)}\s*=")
     lines = text.splitlines(keepends=True)
     out: list[str] = []
     seen = False
@@ -287,16 +290,36 @@ def _replace_allowed_users(existing: bytes, users: str) -> bytes:
     return "".join(out).encode("utf-8")
 
 
-def plan_profile_update(raw: bytes, documents: Sequence[object]) -> tuple[bytes, dict[str, Any]]:
+def _ensure_allow_all_false(raw: bytes) -> bytes:
+    """Record Hermes's default when the variable is absent. Leave an explicit false value."""
+    try:
+        values = env_assignment_values(raw, _ALLOW_ALL)
+    except EnvFileError:
+        raise InboundAllowError("control allowlist is unusable") from None
+    if len(values) > 1:
+        raise InboundAllowError("existing authorization cannot be established")
+    if len(values) == 1:
+        token = _unquote(values[0]).strip().lower()
+        if token in {"true", "1", "yes"}:
+            raise InboundAllowError("allow_all_users is not a control authorization")
+        return raw
+    return _upsert_assignment(raw, _ALLOW_ALL, "false")
+
+
+def plan_profile_update(
+    raw: bytes,
+    documents: Sequence[object],
+    humans: Sequence[str],
+) -> tuple[bytes, dict[str, Any]]:
     """Return updated env bytes and a public view. Does not write."""
     if not isinstance(raw, (bytes, bytearray)):
         raise InboundAllowError("control profile is unusable")
     before_private = _private_values(bytes(raw))
     if len(before_private) != 1 or not before_private[0].strip():
         raise InboundAllowError("control profile is unusable")
-    existing = current_allowed_users(bytes(raw))
-    merged = merge_allowed_users(existing, verified_worker_hexes(documents))
-    updated = _replace_allowed_users(bytes(raw), ",".join(merged))
+    merged = merge_allowed_users(humans, verified_worker_hexes(documents))
+    updated = _upsert_assignment(bytes(raw), _ALLOWED_USERS, ",".join(merged))
+    updated = _ensure_allow_all_false(updated)
     after_private = _private_values(updated)
     if after_private != before_private:
         raise InboundAllowError("refusing to modify BUZZ_PRIVATE_KEY")
@@ -314,6 +337,36 @@ def plan_profile_update(raw: bytes, documents: Sequence[object]) -> tuple[bytes,
     return updated, view
 
 
+def _snapshot(opened: OpenedHermesProfile, raw: bytes) -> dict[str, Any]:
+    try:
+        effective = effective_buzz_authorization(opened, raw)
+    except HermesAuthzError as exc:
+        raise InboundAllowError(exc.public_message) from None
+    return {
+        "allow_all_users": False,
+        "allow_all_source": effective.allow_all_source,
+        "authorized_humans": list(effective.humans),
+        "human_sources": list(effective.human_sources),
+    }
+
+
+def inspect_inbound_authorization(
+    *,
+    profiles_root: str,
+    configured_profile: object,
+    gateway_units: Sequence[object],
+) -> dict[str, Any]:
+    """Public diagnostic. Does not write and does not print secrets."""
+    profile = bind_control_profile(gateway_units, configured_profile)
+    with open_named_profile(profile, profiles_root=profiles_root) as opened:
+        raw = opened.read_env()
+        view = _snapshot(opened, raw)
+    view["profile"] = profile
+    view["diagnose"] = True
+    view["changed"] = False
+    return view
+
+
 def apply_inbound_authorization(
     *,
     profiles_root: str,
@@ -325,23 +378,35 @@ def apply_inbound_authorization(
     profile = bind_control_profile(gateway_units, configured_profile)
     with open_named_profile(profile, profiles_root=profiles_root) as opened:
         raw = opened.read_env()
-        updated, view = plan_profile_update(raw, documents)
+        snapshot = _snapshot(opened, raw)
+        updated, view = plan_profile_update(raw, documents, snapshot["authorized_humans"])
         if updated != raw:
             opened.replace_env(updated)
     with open_named_profile(profile, profiles_root=profiles_root) as opened:
         after = opened.read_env()
     if _private_values(after) != _private_values(raw):
         raise InboundAllowError("refusing to modify BUZZ_PRIVATE_KEY")
-    confirmed = current_allowed_users(after)
+    confirmed = _written_allowed_users(after)
     if tuple(view["allowed_users"]) != confirmed:
         raise InboundAllowError("control allowlist is unusable")
     view["profile"] = profile
     view["changed"] = after != raw
     view["allow_all_users"] = False
+    view["allow_all_source"] = snapshot["allow_all_source"]
+    view["authorized_humans"] = snapshot["authorized_humans"]
+    view["human_sources"] = snapshot["human_sources"]
     return view
 
 
-def _load_request(raw: bytes) -> tuple[list[object], list[object]]:
+def _diagnose_requested(parsed: Mapping[str, Any]) -> bool:
+    flag = os.environ.get(DIAGNOSE_KEY, "")
+    if str(flag).strip().lower() in {"1", "true", "yes"}:
+        return True
+    marker = parsed.get("diagnose")
+    return marker is True
+
+
+def _load_request(raw: bytes) -> tuple[list[object], list[object], bool]:
     if not raw or len(raw) > 1_000_000 or b"\x00" in raw:
         raise InboundAllowError("invalid inbound request")
     try:
@@ -357,10 +422,13 @@ def _load_request(raw: bytes) -> tuple[list[object], list[object]]:
     if not isinstance(parsed, dict):
         raise InboundAllowError("invalid inbound request")
     units = parsed.get("gateway_units")
-    workers = parsed.get("workers")
+    workers = parsed.get("workers", [])
+    diagnose = _diagnose_requested(parsed)
     if not isinstance(units, list) or not isinstance(workers, list):
         raise InboundAllowError("invalid inbound request")
-    return units, workers
+    if not diagnose and "workers" not in parsed:
+        raise InboundAllowError("invalid inbound request")
+    return units, workers, diagnose
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -376,13 +444,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     configured = os.environ.get(PROFILE_KEY)
     root = os.environ.get(PROFILES_ROOT_KEY) or HERMES_PROFILES_DIR
     try:
-        units, workers = _load_request(sys.stdin.buffer.read(1_000_001))
-        view = apply_inbound_authorization(
-            profiles_root=root,
-            configured_profile=configured,
-            gateway_units=units,
-            documents=workers,
-        )
+        units, workers, diagnose = _load_request(sys.stdin.buffer.read(1_000_001))
+        if diagnose:
+            view = inspect_inbound_authorization(
+                profiles_root=root,
+                configured_profile=configured,
+                gateway_units=units,
+            )
+        else:
+            view = apply_inbound_authorization(
+                profiles_root=root,
+                configured_profile=configured,
+                gateway_units=units,
+                documents=workers,
+            )
     except InboundAllowError as exc:
         sys.stdout.write(
             json.dumps(

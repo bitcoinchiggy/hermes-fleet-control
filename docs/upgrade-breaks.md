@@ -34,8 +34,9 @@ python3 install-control-runtime --python /usr/bin/python3.12
 `PATH` may start it. `--python` is required. It is the absolute
 interpreter that runs `python -m venv runtime/venv` and then
 `runtime/venv/bin/python -m pip install --require-virtualenv --require-hashes --only-binary=:all: -r requirements.lock`.
-The lock pins `cryptography==50.0.2` and the transitive pins
-`cffi==2.1.1` and `pycparser==3.0`, each with reviewed wheel hashes.
+The lock pins `cryptography==50.0.2` and `PyYAML==6.0.2`, plus the
+transitive pins `cffi==2.1.1` and `pycparser==3.0`, each with reviewed
+wheel hashes.
 `requirements.txt` only records the direct pin. The command that worked
 in the failure was `/usr/bin/python3.12`. Confirm that binary on the
 host before using it. Do not point this at
@@ -67,26 +68,45 @@ turn.
 `config/fleet.yaml` `buzz.allowed_users` is worker-guest policy. Fleet
 `communicate` writes it onto worker profiles. It does not select
 Control's active gateway profile and it does not write Control's
-`.env`. The gateway that receives the worker's reply allows only the
-public keys in that profile's `BUZZ_ALLOWED_USERS`. The worker's public
-key was not among them.
+`.env`. The reported Control profile has no `BUZZ_ALLOWED_USERS`.
+That variable is not the whole allowlist. Hermes (hermes-agent
+`be5e9f72c6681af9dfb75bf480f08844f1499949`) authorizes a Buzz sender from
+the env list when it is non-empty, otherwise from `config.yaml`
+`allowed_users`, and when that list is also empty from pairing approvals
+plus `allow_from` and nostr-shaped `GATEWAY_ALLOWED_USERS` entries. A
+non-empty Buzz allowlist is also the adapter intake filter, so a pairing
+approval outside it is not currently effective.
+
+Absent `BUZZ_ALLOW_ALL_USERS` uses the Hermes default of false. The
+truthy values are `true`, `1`, and `yes`. The same default applies to an
+absent `allow_all_users` in `config.yaml` and to an absent
+`GATEWAY_ALLOW_ALL_USERS`. An open grant is not a finite set of humans,
+so the command refuses it.
 
 Pairing, `allow_all_users`, and polling are not the authorization
 model. `fleet.yaml` does not govern Control. Replacing the profile list
-with the fleet.yaml humans would drop extra existing human keys.
+with the fleet.yaml humans would drop extra existing human keys. A
+missing `BUZZ_ALLOWED_USERS` variable is not an empty effective allowlist.
 hermes-fleet only checks that fleet policy is not `allow_all_users` and
 names the apply command. It does not emit a replacement allowlist.
 
 The supported apply command is Control-local `fleet-allow-inbound`. It
-is not an MCP tool. It reads the active profile, keeps every current
-public key in order (extra existing human keys are preserved), and
-appends `operator` then `researcher` when `buzz_npub` decodes to
+is not an MCP tool. It reads the active profile, keeps every currently
+effective public key in order (extra existing human keys are preserved),
+and appends `operator` then `researcher` when `buzz_npub` decodes to
 `buzz_public_key_hex`. `allow_all_users` stays false. `BUZZ_PRIVATE_KEY`
 is preserved and is not printed. A second run with the same keys does
-not change the file. The command does not import a worker
+not change the file. Unreadable config or pairing state fails closed
+and does not write. The command does not import a worker
 key-derivation package, does not read worker private keys, does not
 accept provisioner administration credentials, and does not use a guest
 agent.
+
+A public diagnostic reads the same sources and writes nothing. Set
+`FLEET_CONTROL_INBOUND_DIAGNOSE=1`, or pass `"diagnose": true` in the
+stdin JSON. The result lists `authorized_humans`, `human_sources`, and
+`allow_all_source`. It does not print credentials, private keys, or
+pairing display names.
 
 Reviewed steps, not performed by this change:
 
