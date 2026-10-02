@@ -49,8 +49,17 @@ _CURRENT = _LEGACY + (
     "origin_session_key",
     "reply_event_ids",
 )
+_ROUTED = _CURRENT + (
+    "origin_thread_id",
+    "origin_message_id",
+    "origin_chat_type",
+    "origin_scope_id",
+    "origin_user_id",
+)
 _LEGACY_KEYS = tuple(sorted(_LEGACY))
 _CURRENT_KEYS = tuple(sorted(_CURRENT))
+_ROUTED_KEYS = tuple(sorted(_ROUTED))
+_CHAT_TYPES = frozenset({"dm", "group", "channel", "thread"})
 
 
 def ensure_journal_dir(path: Path) -> Path:
@@ -119,13 +128,15 @@ def read_record(directory: Path, delegation_id: str) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         raise fail("journal_unusable")
     keys = tuple(sorted(parsed))
-    if keys not in (_LEGACY_KEYS, _CURRENT_KEYS):
+    if keys not in (_LEGACY_KEYS, _CURRENT_KEYS, _ROUTED_KEYS):
         raise fail("journal_unusable")
     if parsed.get("delegation_id") != delegation_id or parsed.get("state") not in STATES:
         raise fail("journal_unusable")
     _validate_identity(parsed)
-    if keys == _CURRENT_KEYS:
+    if keys in (_CURRENT_KEYS, _ROUTED_KEYS):
         _validate_current(parsed)
+    if keys == _ROUTED_KEYS:
+        _validate_routed(parsed)
     return parsed
 
 
@@ -180,6 +191,11 @@ def fresh_record(
     origin_platform: str | None = None,
     origin_chat_id: str | None = None,
     origin_session_key: str | None = None,
+    origin_thread_id: str | None = None,
+    origin_message_id: str | None = None,
+    origin_chat_type: str | None = None,
+    origin_scope_id: str | None = None,
+    origin_user_id: str | None = None,
 ) -> dict[str, Any]:
     now = utc_rfc3339()
     record: dict[str, Any] = {
@@ -207,6 +223,22 @@ def fresh_record(
     record["origin_chat_id"] = origin_chat_id
     record["origin_session_key"] = origin_session_key
     record["reply_event_ids"] = []
+    routed = (
+        origin_thread_id,
+        origin_message_id,
+        origin_chat_type,
+        origin_scope_id,
+        origin_user_id,
+    )
+    if all(value is None for value in routed):
+        return record
+    if any(value is None for value in routed):
+        raise fail("journal_unusable")
+    record["origin_thread_id"] = origin_thread_id
+    record["origin_message_id"] = origin_message_id
+    record["origin_chat_type"] = origin_chat_type
+    record["origin_scope_id"] = origin_scope_id
+    record["origin_user_id"] = origin_user_id
     return record
 
 
@@ -280,6 +312,20 @@ def _validate_current(parsed: Mapping[str, Any]) -> None:
         or any(not isinstance(item, str) or not _HEX64_RE.fullmatch(item) for item in replies)
     ):
         raise fail("journal_unusable")
+
+
+def _validate_routed(parsed: Mapping[str, Any]) -> None:
+    chat_type = parsed.get("origin_chat_type")
+    if not isinstance(chat_type, str) or chat_type not in _CHAT_TYPES:
+        raise fail("journal_unusable")
+    for field in ("origin_thread_id", "origin_message_id", "origin_scope_id", "origin_user_id"):
+        value = parsed.get(field)
+        if not isinstance(value, str) or len(value) > 256:
+            raise fail("journal_unusable")
+        if value and any(ord(char) < 32 or char.isspace() for char in value):
+            raise fail("journal_unusable")
+        if value and ("nsec1" in value.lower() or "buzz_private_key" in value.lower()):
+            raise fail("journal_unusable")
 
 
 def update_record(record: dict[str, Any], **changes: Any) -> dict[str, Any]:

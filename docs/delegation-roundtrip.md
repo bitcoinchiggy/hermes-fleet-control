@@ -19,19 +19,25 @@ It prints one JSON record from
 `FLEET_DELEGATION_JOURNAL_DIR` when that absolute override is set).
 The record holds `task`, `origin_platform`, `origin_chat_id`,
 `origin_session_key`, `worker`, `worker_public_key_hex`, `channel_id`,
-`event_id`, and `reply_event_ids`. Records written before this revision
-remain readable and are not backfilled.
+`event_id`, and `reply_event_ids`. A routed record also holds
+`origin_thread_id`, `origin_message_id`, `origin_chat_type`,
+`origin_scope_id`, and `origin_user_id`. Records written before this
+revision remain readable and are not backfilled.
 
 ## What Control does
 
 `delegate_worker` reads the origin from the helper environment
 `FLEET_CONTROL_ORIGIN_PLATFORM`, `FLEET_CONTROL_ORIGIN_CHAT_ID`, and
-`FLEET_CONTROL_ORIGIN_SESSION_KEY`. The MCP server sets those for one
-`fleet-delegate` process from `_meta["hermes.fleet.origin"]` and
-deletes any inherited copy first. The tool schema is still `worker`,
-`task`, and optional `delegation_id`. A missing or non-messaging origin
-fails closed before the worker DM is sent. An origin that is the worker
-DM itself fails closed after the DM is opened and does not send.
+`FLEET_CONTROL_ORIGIN_SESSION_KEY`. When the gateway also supplies the
+topic route, it reads `FLEET_CONTROL_ORIGIN_THREAD_ID`,
+`FLEET_CONTROL_ORIGIN_MESSAGE_ID`, `FLEET_CONTROL_ORIGIN_CHAT_TYPE`,
+`FLEET_CONTROL_ORIGIN_SCOPE_ID`, and `FLEET_CONTROL_ORIGIN_USER_ID`.
+The MCP server sets those for one `fleet-delegate` process from
+`_meta["hermes.fleet.origin"]` and deletes any inherited copy first.
+The tool schema is still `worker`, `task`, and optional `delegation_id`.
+A missing or non-messaging origin fails closed before the worker DM is
+sent. An origin that is the worker DM itself fails closed after the DM
+is opened and does not send.
 
 The worker message stays `[fleet-delegation <id>]` plus the task. It
 does not contain the human platform, chat id, or session key.
@@ -47,46 +53,48 @@ the worker turn and does not guess a destination. A different
 new `delegate_worker` call, which sends a new top-level DM with no
 `--reply-to`.
 
-## Required Hermes change
+## Hermes patch
 
-Deployed Hermes `7817bf522af3caf54b30ae59f16157469d7638fc` does not do
-either of the following. Installing these helpers does not stop the
-reply loop.
+The reviewable patch against Hermes
+`7817bf522af3caf54b30ae59f16157469d7638fc` is
+`patches/hermes-delegation-handoff/delegation-handoff.patch` in
+hermes-fleet. This checkout does not fork Hermes. Installing these
+helpers does not stop the reply loop.
 
-1. In `tools/mcp_tool_handlers.py`, `_call_tool_racing_stdio_death`
-   calls `server.session.call_tool(tool_name, arguments=args)`.
-   `mcp==2.0.0` accepts keyword-only `meta`. For the Fleet Control
-   server's `delegate_worker` tool only, pass the current gateway
-   ContextVars from `gateway.session_context.get_session_env`:
+`run_coroutine_threadsafe` copies the MCP loop's context, not the
+gateway turn's. Reading `get_session_env` inside
+`_call_tool_racing_stdio_death` is not sufficient: an unset ContextVar
+falls back to `os.environ`, and the MCP loop never bound the turn.
+The sync handler snapshots the turn ContextVars before the hop and
+passes `meta={"hermes.fleet.origin": ...}` only for the configured
+Fleet server's `delegate_worker` tool. The origin carries platform,
+chat, session, thread or topic, reply anchor, chat type, scope, and
+user id. Other MCP servers and ordinary worker gateways are unchanged.
 
-   ```python
-   meta={
-       "hermes.fleet.origin": {
-           "platform": get_session_env("HERMES_SESSION_PLATFORM"),
-           "chat_id": get_session_env("HERMES_SESSION_CHAT_ID"),
-           "session_key": get_session_env("HERMES_SESSION_KEY"),
-       }
-   }
-   ```
+The Buzz adapter calls `fleet-delegation-intake` only when
+`HERMES_FLEET_CONTROL_INTEGRATION=1` and the event has a reply parent.
+The sender is the inbound event's public key. The worker text is the
+result inside `wake_text`. It is not parsed as a route, and the resumed
+turn sets `allow_gateway_control` false so it cannot run a gateway
+command. A successful correlation does not call `handle_message` on the
+worker DM, does not send, and does not send a reaction or an error
+notice. `report_to` resumes the stored session on that platform's
+adapter, including the topic. `handle_message` derives the session key
+and delivers the final text with that adapter's `send`.
 
-   Do not copy tool arguments into `_meta`. Do not attach this meta to
-   other MCP servers. The long-lived MCP process does not see per-turn
-   `HERMES_SESSION_*` updates in its own environment.
+A helper failure (missing binary, timeout, non-zero exit, or unusable
+output) returns the event to the normal Buzz path. It does not drop
+unrelated messages and it does not invent an error send into the worker
+DM. Suppression requires a successful intake decision.
+`kind` `not_delegation_reply` keeps the existing dispatch.
 
-2. In `plugins/platforms/buzz/adapter.py`, before `_dispatch_message`,
-   run `fleet-delegation-intake` with the observed reply parent, the
-   event sender pubkey, the inbound text, the inbound event id, and
-   `reply_to_text` when the cache has it. Use the managed interpreter
-   from this checkout, not Hermes `python3`. Then:
-
-   - A non-zero exit does not call `handle_message` and does not call
-     `_notify_turn_error` (`gateway/platforms/base.py`).
-   - `suppress_worker_delivery` true does not dispatch and does not send
-     an error to the worker chat.
-   - `report_to` set starts a turn in that platform, chat, and session
-     with `wake_text` as the user message. The model's final text is
-     delivered with that platform's adapter, not back into the worker DM.
-   - `kind` `not_delegation_reply` keeps the existing dispatch.
+The patch adds `gateway/fleet_delegation.py` and two anchored call
+sites, marked `FLEET_DELEGATION_META` and `FLEET_DELEGATION_HANDOFF`.
+A Hermes update that replaces those files drops the call sites. Reapply
+the patch onto the pinned commit, or replay the two hunks if the
+anchors still match. `patches/hermes-delegation-handoff/check-anchors.py`
+fails when either anchor is missing. Do not start the operator gateway
+on a tree where the check fails.
 
 ## Deployment order
 
@@ -95,12 +103,12 @@ gateway.
 
 1. Install this hermes-fleet-control revision on Control. Leave the
    operator gateway stopped.
-2. Patch and restart Hermes Control so `delegate_worker` receives the
-   origin meta and the Buzz adapter runs `fleet-delegation-intake`
-   before dispatch.
+2. Apply the Hermes patch, set `HERMES_FLEET_CONTROL_INTEGRATION=1`,
+   `HERMES_FLEET_MCP_SERVER`, and `HERMES_FLEET_CONTROL_ROOT`, and
+   restart Hermes Control. Confirm `check-anchors.py` passes.
 3. Confirm with `fleet-delegation-show` that a new record contains the
-   task, origin, worker key, and event id, and that the worker DM body
-   does not contain the origin.
+   task, origin, thread when the conversation has one, worker key, and
+   event id, and that the worker DM body does not contain the origin.
 4. Start the operator gateway only after that Hermes restart.
 
 Starting operator before step 2 restores the reply loop. On

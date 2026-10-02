@@ -64,6 +64,11 @@ class DelegationReplyPlan:
                 "platform": self.report_to.platform,
                 "chat_id": self.report_to.chat_id,
                 "session_key": self.report_to.session_key,
+                "thread_id": self.report_to.thread_id,
+                "message_id": self.report_to.message_id,
+                "chat_type": self.report_to.chat_type,
+                "scope_id": self.report_to.scope_id,
+                "user_id": self.report_to.user_id,
             }
         return {
             "kind": self.kind,
@@ -135,6 +140,11 @@ def plan_delegation_reply(
         record.get("origin_platform"),
         record.get("origin_chat_id"),
         record.get("origin_session_key"),
+        thread_id=record.get("origin_thread_id", ""),
+        message_id=record.get("origin_message_id", ""),
+        chat_type=record.get("origin_chat_type", ""),
+        scope_id=record.get("origin_scope_id", ""),
+        user_id=record.get("origin_user_id", ""),
     )
     if "origin_platform" not in record:
         return _correlated(

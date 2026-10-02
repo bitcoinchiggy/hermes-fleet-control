@@ -20,9 +20,12 @@ and the accepted event. `fleet-delegation-show <delegation_id>` prints
 that record. It is not a task viewer. The origin is copied from Hermes
 MCP `_meta["hermes.fleet.origin"]` for that one call. The model payload
 cannot set it, and it is not written into the worker message.
-`fleet-delegation-intake` is what the gateway runs on an inbound reply.
-Deployed Hermes `7817bf522af3caf54b30ae59f16157469d7638fc` does not call
-it, so that gateway still delivers its reply into the worker DM.
+`fleet-delegation-intake` is what the patched gateway runs on an inbound
+reply when `HERMES_FLEET_CONTROL_INTEGRATION=1`. Unpatched Hermes
+`7817bf522af3caf54b30ae59f16157469d7638fc` does not call it, so that
+gateway still delivers its reply into the worker DM. The reviewable
+patch and the reapply check live in hermes-fleet at
+`patches/hermes-delegation-handoff/`.
 [docs/delegation-roundtrip.md](docs/delegation-roundtrip.md) records the
 private-coordination decision, the Hermes change, and the deployment
 order.
