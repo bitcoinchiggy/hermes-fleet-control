@@ -20,6 +20,7 @@ from fleet_control.support.profile_env import HERMES_PROFILES_DIR, validate_prof
 from fleet_control.support.redact import NSEC_RE
 
 from fleet_control.authorize import authorize_target
+from fleet_control.coordination import coordination_channel_id
 from fleet_control.buzz_exec import (
     HEX64_RE,
     UUID_RE,
@@ -218,26 +219,13 @@ def _with_lock(
 
     binary = buzz_binary(env)
     child_env = identity.child_env(env)
-    try:
-        code, stdout = invoke(
-            buzz_runner, open_dm_argv(binary, target.public_key_hex), child_env, b""
+    configured = coordination_channel_id(profile, profiles_root)
+    if configured is not None:
+        channel_id = _channel_for_new_work(directory, record, origin, configured)
+    else:
+        channel_id = _open_worker_dm(
+            directory, record, origin, buzz_runner, binary, target.public_key_hex, child_env
         )
-        if code != 0:
-            raise fail("dm_open_failed")
-        channel_id = parse_dm_open(stdout)
-        if targets_worker_dm(origin, channel_id):
-            write_record(directory, update_record(record, state="failed", channel_id=channel_id))
-            raise fail("origin_invalid")
-    except ControlError as exc:
-        if exc.code in ("dm_open_failed", "dm_open_malformed", "helper_failed"):
-            write_record(directory, update_record(record, state="failed"))
-        raise
-    except (BuzzTimeout, BuzzOutputUnusable):
-        write_record(directory, update_record(record, state="failed"))
-        raise fail("dm_open_failed") from None
-    except Exception:
-        write_record(directory, update_record(record, state="failed"))
-        raise fail("dm_open_failed") from None
 
     started = False
 
@@ -277,6 +265,47 @@ def _with_lock(
     )
     write_record(directory, record)
     return _receipt(delegation_id, worker, channel_id, event_id)
+
+
+def _channel_for_new_work(directory: Path, record: dict[str, Any], origin: Any, configured: str) -> str:
+    """Use the record's channel when it already has one. Do not retarget it."""
+    existing = record.get("channel_id")
+    channel_id = existing if isinstance(existing, str) and existing else configured
+    if targets_worker_dm(origin, channel_id):
+        write_record(directory, update_record(record, state="failed", channel_id=channel_id))
+        raise fail("origin_invalid")
+    return channel_id
+
+
+def _open_worker_dm(
+    directory: Path,
+    record: dict[str, Any],
+    origin: Any,
+    buzz_runner,
+    binary: str,
+    public_hex: str,
+    child_env: dict[str, str],
+) -> str:
+    """Open the legacy worker DM. Used only when no coordination channel is configured."""
+    try:
+        code, stdout = invoke(buzz_runner, open_dm_argv(binary, public_hex), child_env, b"")
+        if code != 0:
+            raise fail("dm_open_failed")
+        channel_id = parse_dm_open(stdout)
+        if targets_worker_dm(origin, channel_id):
+            write_record(directory, update_record(record, state="failed", channel_id=channel_id))
+            raise fail("origin_invalid")
+    except ControlError as exc:
+        if exc.code in ("dm_open_failed", "dm_open_malformed", "helper_failed"):
+            write_record(directory, update_record(record, state="failed"))
+        raise
+    except (BuzzTimeout, BuzzOutputUnusable):
+        write_record(directory, update_record(record, state="failed"))
+        raise fail("dm_open_failed") from None
+    except Exception:
+        write_record(directory, update_record(record, state="failed"))
+        raise fail("dm_open_failed") from None
+    return channel_id
 
 
 def _caller_delegation_id(payload: Any) -> str | None:

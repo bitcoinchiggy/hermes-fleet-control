@@ -34,6 +34,7 @@ MESSAGES = {
     "journal_unusable": "delegation journal is unusable",
     "origin_unavailable": "originating conversation is unavailable",
     "origin_invalid": "originating conversation is not a safe destination",
+    "coordination_channel_invalid": "coordination channel is unusable",
     "delegation_not_found": "delegation record was not found",
     "helper_failed": "fleet helper failed",
     "internal_error": "delegation failed",
