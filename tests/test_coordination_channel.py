@@ -21,15 +21,14 @@ from fleet_control.delegation_reply import (
 )
 from fleet_control.errors import ControlError
 from fleet_control.journal import ensure_journal_dir, fresh_record, update_record, write_record
-from tests.test_fleet_control_delegate import (
-    CONTROL_NSEC,
-    DM_ID,
-    EVENT_ID,
-    SUPPLIED_ID,
-    TASK,
-    WORKER_HEX,
-    DelegateTests,
-)
+import tests.test_fleet_control_delegate as _delegate_mod
+
+CONTROL_NSEC = _delegate_mod.CONTROL_NSEC
+DM_ID = _delegate_mod.DM_ID
+EVENT_ID = _delegate_mod.EVENT_ID
+SUPPLIED_ID = _delegate_mod.SUPPLIED_ID
+TASK = _delegate_mod.TASK
+WORKER_HEX = _delegate_mod.WORKER_HEX
 
 CHANNEL = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 OTHER_HEX = "cd" * 32
@@ -52,25 +51,35 @@ def _profile(root: Path, text: str) -> dict[str, str]:
     }
 
 
-class CoordinationChannelTests(DelegateTests):
+class CoordinationChannelTests(unittest.TestCase):
+    def setUp(self):
+        self.host = _delegate_mod.DelegateTests()
+        self.host.setUp()
+
+    def tearDown(self):
+        self.host.tearDown()
+
+    def delegate(self, payload=None, **kwargs):
+        return self.host.delegate(payload, **kwargs)
+
     def test_new_work_is_a_mentioned_channel_message_and_keeps_the_human_origin(self):
-        env = _profile(Path(self.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
+        env = _profile(Path(self.host.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
         result = self.delegate(environ=env)
         self.assertEqual(result["channel_id"], CHANNEL)
-        self.assertEqual(len(self.buzz.calls), 1)
-        argv = self.buzz.calls[0]["argv"]
+        self.assertEqual(len(self.host.buzz.calls), 1)
+        argv = self.host.buzz.calls[0]["argv"]
         self.assertEqual(argv[1:3], ["messages", "send"])
         self.assertIn("--channel", argv)
         self.assertIn(CHANNEL, argv)
         self.assertIn("--mention", argv)
         self.assertIn(WORKER_HEX, argv)
         self.assertNotIn("dms", argv)
-        stdin = self.buzz.calls[0]["stdin"].decode("utf-8")
+        stdin = self.host.buzz.calls[0]["stdin"].decode("utf-8")
         self.assertTrue(stdin.startswith("[fleet-delegation "))
         self.assertNotIn("nsec1", stdin.lower())
         self.assertNotIn("BUZZ_PRIVATE_KEY", stdin)
         self.assertNotIn(CONTROL_NSEC, stdin)
-        record = json.loads((self.journal / f"{result['delegation_id']}.json").read_text(encoding="utf-8"))
+        record = json.loads((self.host.journal / f"{result['delegation_id']}.json").read_text(encoding="utf-8"))
         self.assertEqual(record["origin_platform"], "telegram")
         self.assertEqual(record["origin_chat_id"], "424242")
         self.assertEqual(record["channel_id"], CHANNEL)
@@ -78,35 +87,35 @@ class CoordinationChannelTests(DelegateTests):
         self.assertNotIn("nsec", json.dumps(record).lower())
 
     def test_invalid_channel_does_not_send(self):
-        env = _profile(Path(self.tmp.name) / "profiles", "fleet:\n  coordination_channel_id: not-a-channel\n")
+        env = _profile(Path(self.host.tmp.name) / "profiles", "fleet:\n  coordination_channel_id: not-a-channel\n")
         with self.assertRaises(ControlError) as caught:
             self.delegate(environ=env)
         self.assertEqual(caught.exception.code, "coordination_channel_invalid")
-        self.assertEqual(self.buzz.calls, [])
+        self.assertEqual(self.host.buzz.calls, [])
 
     def test_origin_inside_the_channel_is_rejected_before_send(self):
-        env = _profile(Path(self.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
+        env = _profile(Path(self.host.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
         env["FLEET_CONTROL_ORIGIN_PLATFORM"] = "buzz"
         env["FLEET_CONTROL_ORIGIN_CHAT_ID"] = CHANNEL
         env["FLEET_CONTROL_ORIGIN_SESSION_KEY"] = f"agent:main:buzz:channel:{CHANNEL}"
         with self.assertRaises(ControlError) as caught:
             self.delegate(environ=env)
         self.assertEqual(caught.exception.code, "origin_invalid")
-        self.assertEqual(self.buzz.calls, [])
+        self.assertEqual(self.host.buzz.calls, [])
 
     def test_accepted_dm_record_is_not_moved_onto_the_channel(self):
         first = self.delegate({"worker": "operator", "task": TASK, "delegation_id": SUPPLIED_ID})
         self.assertEqual(first["channel_id"], DM_ID)
-        calls = len(self.buzz.calls)
-        env = _profile(Path(self.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
+        calls = len(self.host.buzz.calls)
+        env = _profile(Path(self.host.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
         second = self.delegate(
             {"worker": "operator", "task": TASK, "delegation_id": SUPPLIED_ID},
             environ=env,
         )
         self.assertEqual(second["channel_id"], DM_ID)
         self.assertEqual(second["event_id"], EVENT_ID)
-        self.assertEqual(len(self.buzz.calls), calls)
-        record = json.loads((self.journal / f"{SUPPLIED_ID}.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(self.host.buzz.calls), calls)
+        record = json.loads((self.host.journal / f"{SUPPLIED_ID}.json").read_text(encoding="utf-8"))
         self.assertEqual(record["origin_chat_id"], "424242")
         self.assertEqual(record["channel_id"], DM_ID)
 
@@ -124,14 +133,14 @@ class CoordinationChannelTests(DelegateTests):
             origin_session_key="agent:main:telegram:dm:424242",
         )
         record = update_record(record, state="pending", channel_id=DM_ID)
-        ensure_journal_dir(self.journal)
-        write_record(self.journal, record)
-        env = _profile(Path(self.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
+        ensure_journal_dir(self.host.journal)
+        write_record(self.host.journal, record)
+        env = _profile(Path(self.host.tmp.name) / "profiles", f"fleet:\n  coordination_channel_id: {CHANNEL}\n")
         with self.assertRaises(ControlError) as caught:
             self.delegate({"worker": "operator", "task": TASK, "delegation_id": SUPPLIED_ID}, environ=env)
         self.assertEqual(caught.exception.code, "delegation_ambiguous")
-        self.assertEqual(self.buzz.calls, [])
-        stored = json.loads((self.journal / f"{SUPPLIED_ID}.json").read_text(encoding="utf-8"))
+        self.assertEqual(self.host.buzz.calls, [])
+        stored = json.loads((self.host.journal / f"{SUPPLIED_ID}.json").read_text(encoding="utf-8"))
         self.assertEqual(stored["channel_id"], DM_ID)
         self.assertEqual(stored["origin_chat_id"], "424242")
         self.assertEqual(stored["state"], "ambiguous")
