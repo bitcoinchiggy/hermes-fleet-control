@@ -31,7 +31,9 @@ def coordination_channel_id(profile: str, profiles_root: str) -> str | None:
     except Exception:
         raise fail("coordination_channel_invalid") from None
     path = Path(profiles_root) / name / "config.yaml"
-    if path.is_symlink() or not path.is_file():
+    if path.is_symlink():
+        raise fail("coordination_channel_invalid")
+    if not path.is_file():
         return None
     try:
         import yaml
@@ -41,10 +43,12 @@ def coordination_channel_id(profile: str, profiles_root: str) -> str | None:
         raise fail("coordination_channel_invalid") from None
     if not isinstance(loaded, dict):
         raise fail("coordination_channel_invalid")
-    fleet = loaded.get("fleet")
-    if fleet is None:
+    if "fleet" not in loaded or loaded.get("fleet") is None:
         return None
-    if not isinstance(fleet, dict) or "coordination_channel_id" not in fleet:
+    fleet = loaded.get("fleet")
+    if not isinstance(fleet, dict):
+        raise fail("coordination_channel_invalid")
+    if "coordination_channel_id" not in fleet:
         return None
     value = fleet.get("coordination_channel_id")
     if not isinstance(value, str) or not _UUID_RE.fullmatch(value.strip().lower()):
