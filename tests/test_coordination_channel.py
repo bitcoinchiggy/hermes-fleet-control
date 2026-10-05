@@ -38,7 +38,7 @@ LOOP_PARENT = "07" * 32
 
 def _profile(root: Path, text: str) -> dict[str, str]:
     profile = root / "control"
-    profile.mkdir(parents=True)
+    profile.mkdir(parents=True, exist_ok=True)
     (profile / "config.yaml").write_text(text, encoding="utf-8")
     return {
         "FLEET_CONTROL_HERMES_PROFILE": "control",
@@ -85,6 +85,16 @@ class CoordinationChannelTests(unittest.TestCase):
         self.assertEqual(record["channel_id"], CHANNEL)
         self.assertEqual(record["state"], "accepted")
         self.assertNotIn("nsec", json.dumps(record).lower())
+
+    def test_unreadable_fleet_config_does_not_open_a_dm(self):
+        root = Path(self.host.tmp.name) / "profiles"
+        for text in ("fleet: [\n", "fleet: not-a-map\n"):
+            self.host.buzz.calls.clear()
+            env = _profile(root, text)
+            with self.assertRaises(ControlError) as caught:
+                self.delegate(environ=env)
+            self.assertEqual(caught.exception.code, "coordination_channel_invalid")
+            self.assertEqual(self.host.buzz.calls, [])
 
     def test_invalid_channel_does_not_send(self):
         env = _profile(Path(self.host.tmp.name) / "profiles", "fleet:\n  coordination_channel_id: not-a-channel\n")
