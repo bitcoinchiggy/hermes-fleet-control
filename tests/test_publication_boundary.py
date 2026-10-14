@@ -49,6 +49,7 @@ RUNTIME_MODULES = (
     "fleet_control.identity",
     "fleet_control.inbound_allow",
     "fleet_control.journal",
+    "fleet_control.onboard",
     "fleet_control.origin",
     "fleet_control.output",
     "fleet_control.runtime",
@@ -103,6 +104,7 @@ class PublicationBoundaryTests(unittest.TestCase):
         for name in (
             "fleet-status",
             "fleet-ensure",
+            "fleet-onboard",
             "fleet-delegate",
             "fleet-delegation-intake",
             "fleet-delegation-show",

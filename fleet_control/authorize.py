@@ -7,6 +7,7 @@ public document does not carry.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -14,6 +15,8 @@ from urllib.parse import urlsplit
 from fleet_control.support.nostr_codec import decode_npub
 
 from fleet_control.errors import fail
+
+_ONBOARDING_ID = re.compile(r"^onb_[0-9a-f]{32}$")
 
 
 @dataclass(frozen=True)
@@ -99,9 +102,31 @@ def authorize_target(body: dict[str, Any], requested_name: str) -> DelegationTar
         raise fail("buzz_not_converged")
     if observed.get("buzz_gateway_active") is not True:
         raise fail("gateway_inactive")
+    _require_complete_onboarding(body)
     return DelegationTarget(
         name=requested_name,
         public_key_hex=public_hex,
         npub=npub,
         relay_url=canonical,
     )
+
+
+def _require_complete_onboarding(body: dict[str, Any]) -> None:
+    """Require ``complete`` when a public onboarding journal is present.
+
+    Established workers omit the journal. ``null`` is that same absence.
+    A blocked or running journal is not eligible, even when the worker
+    fields would otherwise pass.
+    """
+    if "onboarding" not in body:
+        return
+    onboarding = body.get("onboarding")
+    if onboarding is None:
+        return
+    if not isinstance(onboarding, dict):
+        raise fail("onboarding_incomplete")
+    ident = onboarding.get("id")
+    if onboarding.get("status") != "complete" or not isinstance(ident, str):
+        raise fail("onboarding_incomplete")
+    if _ONBOARDING_ID.fullmatch(ident) is None:
+        raise fail("onboarding_incomplete")

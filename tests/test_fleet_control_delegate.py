@@ -58,6 +58,22 @@ def profile_bytes(nsec: str = CONTROL_NSEC, relay: str = "wss://buzz.example/") 
     return f"BUZZ_PRIVATE_KEY={nsec}\nBUZZ_RELAY_URL={relay}\n".encode("utf-8")
 
 
+def _onboarding(status: str) -> dict:
+    return {
+        "id": "onb_" + "ab" * 16,
+        "status": status,
+        "stage": "identity",
+        "identity": "verified",
+        "expected_public_key_hex": WORKER_HEX,
+        "expected_npub": WORKER_NPUB,
+        "vmid": 1037,
+        "git_sha": "a" * 40,
+        "retired_reason": None,
+        "error": None,
+        "updated_at": "2026-10-14T00:00:00Z",
+    }
+
+
 def public_worker(**overrides) -> dict:
     """Literal public worker document. No private observed fields."""
     observed = {
@@ -401,6 +417,67 @@ class DelegateTests(unittest.TestCase):
         with self.assertRaises(ControlError) as caught:
             self.delegate(transport=FleetHTTP(mismatched))
         self.assertEqual(caught.exception.code, "undeclared_worker")
+
+    def test_onboarding_journal_must_be_complete(self):
+        complete = _onboarding("complete")
+        blocked = public_worker(onboarding=_onboarding("blocked"))
+        buzz = Buzz()
+        with self.assertRaises(ControlError) as caught:
+            self.delegate(transport=FleetHTTP(blocked), buzz_runner=buzz)
+        self.assertEqual(caught.exception.code, "onboarding_incomplete")
+        self.assertEqual(buzz.calls, [])
+
+        for status in ("running", "retired"):
+            with self.subTest(status=status):
+                buzz = Buzz()
+                body = public_worker(onboarding=_onboarding(status))
+                with self.assertRaises(ControlError) as caught:
+                    self.delegate(transport=FleetHTTP(body), buzz_runner=buzz)
+                self.assertEqual(caught.exception.code, "onboarding_incomplete")
+                self.assertEqual(buzz.calls, [])
+
+        invalid = _onboarding("complete")
+        invalid["id"] = "onb_not-valid"
+        buzz = Buzz()
+        with self.assertRaises(ControlError) as caught:
+            self.delegate(transport=FleetHTTP(public_worker(onboarding=invalid)), buzz_runner=buzz)
+        self.assertEqual(caught.exception.code, "onboarding_incomplete")
+        self.assertEqual(buzz.calls, [])
+
+        self.http = FleetHTTP(public_worker(onboarding=complete))
+        result = self.delegate()
+        self.assertEqual(result["delivery"], "relay_accepted")
+        self.assertEqual(result["worker"], "operator")
+
+        inactive = public_worker(
+            onboarding=complete,
+            observed={"buzz_gateway_active": False},
+        )
+        buzz = Buzz()
+        with self.assertRaises(ControlError) as caught:
+            self.delegate(transport=FleetHTTP(inactive), buzz_runner=buzz)
+        self.assertEqual(caught.exception.code, "gateway_inactive")
+        self.assertEqual(buzz.calls, [])
+
+        unconverged = public_worker(
+            onboarding=complete,
+            observed={"buzz_relay_member": False},
+        )
+        buzz = Buzz()
+        with self.assertRaises(ControlError) as caught:
+            self.delegate(transport=FleetHTTP(unconverged), buzz_runner=buzz)
+        self.assertEqual(caught.exception.code, "buzz_not_converged")
+        self.assertEqual(buzz.calls, [])
+
+    def test_established_worker_without_onboarding_journal(self):
+        self.assertNotIn("onboarding", public_worker())
+        result = self.delegate()
+        self.assertEqual(result["delivery"], "relay_accepted")
+        absent = public_worker(onboarding=None)
+        self.http = FleetHTTP(absent)
+        result = self.delegate()
+        self.assertEqual(result["delivery"], "relay_accepted")
+        self.assertIsNone(absent.get("onboarding"))
 
     def test_relay_mismatch_and_self_target_and_bad_profile(self):
         buzz = Buzz()
@@ -831,10 +908,10 @@ class DelegateTests(unittest.TestCase):
 
 
 class McpSourceTests(unittest.TestCase):
-    def test_server_exposes_only_the_three_tools(self):
+    def test_server_exposes_only_the_fleet_tools(self):
         text = (REPO / "fleet-mcp" / "index.js").read_text()
-        self.assertEqual(text.count('server.registerTool('), 3)
-        for name in ("worker_status", "ensure_worker", "delegate_worker"):
+        self.assertEqual(text.count("server.registerTool("), 4)
+        for name in ("worker_status", "ensure_worker", "onboard_worker", "delegate_worker"):
             self.assertIn(name, text)
         self.assertNotIn('registerTool(\n  "send_message"', text)
         self.assertNotIn("delegate_task", text)

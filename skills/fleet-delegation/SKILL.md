@@ -9,6 +9,10 @@ delegate_worker remains the preferred structured primitive for assigning work to
 
 Do not weaken Buzz mention validation. Do not add a generic message-sending tool. Do not add the worker to the current conversation just so a status @mention will pass. Control retains its other authorized tools for diagnosis, recovery, and general communication.
 
+## Onboarding
+
+Onboarding is `onboard_worker`, not `ensure_worker` and not `delegate_worker`. The worker must already be declared on the provisioner's deployed reconciliation revision. Control cannot create a worker name. Ensure is not a substitute. When the worker status includes an onboarding journal, delegate only after that journal is complete. Workers without an onboarding journal keep the existing checks. An uncertain onboarding result is not retried.
+
 ## Reporting back to the human
 
 When reporting delegation or status back to the human, refer to the Fleet worker by plain name, for example operator, not @operator, unless that worker is actually a member of the current Buzz conversation and an intentional mention is required.

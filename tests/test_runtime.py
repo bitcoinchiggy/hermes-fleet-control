@@ -123,6 +123,7 @@ class HelperBootstrapTests(unittest.TestCase):
         mains = {
             "fleet-status": "fleet_control.status",
             "fleet-ensure": "fleet_control.ensure",
+            "fleet-onboard": "fleet_control.onboard",
             "fleet-delegate": "fleet_control.delegate",
             "fleet-allow-inbound": "fleet_control.inbound_allow",
         }

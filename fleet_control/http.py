@@ -73,6 +73,14 @@ class FleetClient:
         self._name(name)
         return self._json("PUT", f"/v1/workers/{name}/ensure", b"{}")
 
+    def onboard_worker(self, name: str) -> tuple[int, dict[str, Any]]:
+        """POST ``{}`` to onboarding. The caller decides whether this may run."""
+        self._name(name)
+        status, parsed = self._exchange("POST", f"/v1/workers/{name}/onboard", b"{}")
+        if not isinstance(parsed, dict):
+            raise fail("fleet_response_unsafe")
+        return status, parsed
+
     def _name(self, name: str) -> None:
         try:
             validate_worker_name(name)
@@ -80,6 +88,23 @@ class FleetClient:
             raise fail("invalid_name") from None
 
     def _json(self, method: str, path: str, body: bytes | None) -> dict[str, Any]:
+        status, parsed = self._exchange(method, path, body)
+        if status == 404:
+            raise fail("undeclared_worker")
+        if status < 200 or status >= 300:
+            raise fail("fleet_unreachable")
+        if not isinstance(parsed, dict):
+            raise fail("fleet_response_unsafe")
+        return parsed
+
+    def _exchange(self, method: str, path: str, body: bytes | None) -> tuple[int, Any]:
+        """Return a public JSON value and its HTTP status. 401/403 raise."""
+        status, payload = self._read_payload(method, path, body)
+        if status in (401, 403):
+            raise fail("fleet_unauthorized")
+        return status, _parse_public(payload)
+
+    def _read_payload(self, method: str, path: str, body: bytes | None) -> tuple[int, bytes]:
         url = self._settings.url + path
         headers = {
             "Accept": "application/json",
@@ -98,20 +123,16 @@ class FleetClient:
             raise fail("fleet_response_unsafe")
         if len(payload) > MAX_BODY:
             raise fail("fleet_response_unsafe")
-        if status in (401, 403):
-            raise fail("fleet_unauthorized")
-        try:
-            parsed = json.loads(payload.decode("utf-8"))
-        except Exception:
-            raise fail("fleet_response_unsafe") from None
-        _assert_public_json(parsed)
-        if status == 404:
-            raise fail("undeclared_worker")
-        if status < 200 or status >= 300:
-            raise fail("fleet_unreachable")
-        if not isinstance(parsed, dict):
-            raise fail("fleet_response_unsafe")
-        return parsed
+        return status, payload
+
+
+def _parse_public(payload: bytes) -> Any:
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except Exception:
+        raise fail("fleet_response_unsafe") from None
+    _assert_public_json(parsed)
+    return parsed
 
 
 def _assert_public_json(obj: Any) -> None:

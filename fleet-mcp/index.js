@@ -1,7 +1,7 @@
 /**
  * Hermes Control Fleet MCP server.
  *
- * Tools: worker_status, ensure_worker, delegate_worker.
+ * Tools: worker_status, ensure_worker, onboard_worker, delegate_worker.
  * There is no send_message tool. Buzz signing stays in fleet-delegate,
  * which reads the selected profile .env itself. Do not put
  * BUZZ_PRIVATE_KEY or BUZZ_FLEET_MEMBERSHIP_TOKEN in this process.
@@ -20,6 +20,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const statusBin = path.join(root, "fleet-status");
 const ensureBin = path.join(root, "fleet-ensure");
+const onboardBin = path.join(root, "fleet-onboard");
 const delegateBin = path.join(root, "fleet-delegate");
 
 const FORBIDDEN_ENV = [
@@ -154,10 +155,22 @@ server.registerTool(
 );
 
 server.registerTool(
+  "onboard_worker",
+  {
+    description:
+      "Onboard one worker already declared on the provisioner's deployed reconciliation revision. The only argument is that worker's name. Control cannot create a worker name. The helper sends one empty JSON object and does not generate an identity or delegate. Ensure is not a substitute. A later call reads progress and does not submit again, including after an uncertain result. Do not retry an uncertain onboarding.",
+    inputSchema: {
+      name: z.string(),
+    },
+  },
+  async ({ name }) => textResult(await runHelper(onboardBin, [name])),
+);
+
+server.registerTool(
   "delegate_worker",
   {
     description:
-      "Delegate a task to one ready Fleet worker over Buzz. Signs on Control. Returns relay_accepted when the relay accepts the DM. relay_accepted is not worker execution and not task completion. A worker reply is evaluated in the originating human conversation and is not automatically acknowledged in the worker DM. A further instruction is a new delegate_worker call. If a delegation call returns an error containing delegation_id, any retry of that same task MUST reuse that exact delegation_id. A caller must not create a new delegation merely because delivery outcome was uncertain. Reusing an id whose delivery is uncertain does not send the message again. delegate_worker remains the preferred structured primitive for assigning work to Fleet workers. Do not weaken Buzz mention validation. Do not add a generic message-sending tool. Do not add the worker to the current conversation just so a status @mention will pass. Control retains its other authorized tools for diagnosis, recovery, and general communication. When reporting delegation or status back to the human, refer to the Fleet worker by plain name, for example operator, not @operator, unless that worker is actually a member of the current Buzz conversation and an intentional mention is required. An @mention used by the human to identify a worker is input syntax and must not automatically be echoed as an @mention into a different Buzz conversation. Write: Delegated to operator — relay accepted. Do not write: Delegated to @operator — relay accepted. Private Control-worker exchanges stay in the worker DM, and the human receives the evaluated result in the originating conversation.",
+      "Delegate a task to one ready Fleet worker over Buzz. Signs on Control. Returns relay_accepted when the relay accepts the DM. relay_accepted is not worker execution and not task completion. A worker whose status document includes an onboarding journal can be delegated only when that journal status is complete. Established workers without an onboarding journal are unchanged. A worker reply is evaluated in the originating human conversation and is not automatically acknowledged in the worker DM. A further instruction is a new delegate_worker call. If a delegation call returns an error containing delegation_id, any retry of that same task MUST reuse that exact delegation_id. A caller must not create a new delegation merely because delivery outcome was uncertain. Reusing an id whose delivery is uncertain does not send the message again. delegate_worker remains the preferred structured primitive for assigning work to Fleet workers. Do not weaken Buzz mention validation. Do not add a generic message-sending tool. Do not add the worker to the current conversation just so a status @mention will pass. Control retains its other authorized tools for diagnosis, recovery, and general communication. When reporting delegation or status back to the human, refer to the Fleet worker by plain name, for example operator, not @operator, unless that worker is actually a member of the current Buzz conversation and an intentional mention is required. An @mention used by the human to identify a worker is input syntax and must not automatically be echoed as an @mention into a different Buzz conversation. Write: Delegated to operator — relay accepted. Do not write: Delegated to @operator — relay accepted. Private Control-worker exchanges stay in the worker DM, and the human receives the evaluated result in the originating conversation.",
     inputSchema: {
       worker: z.string(),
       task: z.string().min(1).max(8000),
