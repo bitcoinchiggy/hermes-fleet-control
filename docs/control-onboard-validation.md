@@ -1,7 +1,10 @@
 # Control onboarding validation
 
-Pasted observation. This page does not contact a host, create a worker,
-send a retirement request, or change a service.
+Pasted observations. This page does not contact a host, create a
+worker, send a request, or change a service. The onboarding run and
+the retirement run are separate. Automatic completion notifications
+and originating-thread placement are not implemented, so this page
+does not describe the full conversational experience as complete.
 
 ## Observed run
 
@@ -35,16 +38,65 @@ drop-in had to use a name that sorts after `fleet-delegation.conf`.
 
 Both services were restored. Stable Fleet remains
 `b7f4a114ee2ef35b4ff0f1a2abd15efb248576fb`. Stable Control remains
-`dcb3f950b142ef0a4dbd355ca7426b0172aa7d7a`. VM 1037 was deliberately
-kept for a later retirement test. Its identity, complete onboarding
-journal, and generation 1 alias remain. No retirement request was
-sent. Existing agents, inventory, journals, and tombstones were
-preserved.
+`dcb3f950b142ef0a4dbd355ca7426b0172aa7d7a`. At the end of this
+onboarding observation, VM 1037 was deliberately kept for a later
+retirement test. Its identity, complete onboarding journal, and
+generation 1 alias remained. No retirement request had been sent.
+Existing agents, inventory, journals, and tombstones were preserved.
+The retirement observation below is a later pasted run.
 
-## Proposed retirement validation
+## Observed retirement
 
-This section is not authorization to run. Stable Fleet still does not
-declare this worker, so the reviewed declaration commit
+Pasted operator observation of the retirement procedure. It is not an
+independent host check, and it is not authorization to run the
+procedure again.
+
+The operator used reviewed retirement revision
+`63099c4a1f38063d2c0068fa40b94baf74bfb092` while Fleet declaration
+`3b347236158cc65600b7d0697dcbdac58b915024` was the active ref. Stable
+Fleet does not declare `control-onboard-check`.
+
+One `retire_worker` call through the human Control DM accepted
+retirement of `control-onboard-check`. That call did not use `retry`
+or `confirm_retained`.
+
+- Reconciliation: `rec_461586ccfdda444cb0f16b10ef818105`
+- Request: `e245309d-b0cd-4a99-86db-553ffe974c44`
+- Attempt: `2026-10-15T21:00:32Z`
+- Completion: `2026-10-15T21:00:44Z`
+- Target: blue VM 1037
+- Public key: `c2696ef2302c41c1dc288ffbac9ff82622df299c80a62d55d3c2ee1b2c0dd34b`
+- Onboarding id: `onb_babe424e1dd049f19dd0a80bd9bcc476`
+
+Independent cleanup commands run by the operator confirmed the active
+worker record was absent and the VM was absent. Both generation 1 and
+generation 2 inference aliases were absent. Coordination membership
+was absent. The onboarding journal was retired with its original id
+and key binding. The tombstone was present. Other captured VM
+inventory and eight prior provisioner journal and tombstone files
+were unchanged.
+
+One later default `retire_worker` call returned completion from status
+with the same reconciliation id, request id, and timestamps. That is
+consistent with no second submission. This record does not include a
+network trace of either call.
+
+Both stable services were restored. Fleet
+`b7f4a114ee2ef35b4ff0f1a2abd15efb248576fb` was PID 1092874,
+active/running, with zero restarts. Control
+`dcb3f950b142ef0a4dbd355ca7426b0172aa7d7a` was PID 452497,
+active/running, with zero restarts. The operator verified the original
+process settings and Control config. Operator and Researcher were
+unchanged and idle. All 21 prior Control journal files were unchanged.
+The new retirement journal, onboarding reservation, delegation
+journal, provisioner retired journal, and tombstone were preserved.
+Temporary overrides were removed.
+
+## Retirement procedure that was run
+
+The operator ran this procedure once. This section is not authorization
+to run it again. Stable Fleet still does not declare this worker, so
+the reviewed declaration commit
 `3b347236158cc65600b7d0697dcbdac58b915024` has to be the provisioner's
 effective `FLEET_PROVISIONER_GIT_REF` again before `retire_worker` is
 called. A call against stable `main` is not a valid trial of this name.
