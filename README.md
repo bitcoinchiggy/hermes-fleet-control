@@ -1,13 +1,27 @@
 # hermes-fleet-control
 
 Control-side Fleet MCP integration. These helpers let Hermes Control
-read worker status, ensure one worker, and delegate a task over Buzz.
+read worker status, ensure one worker, onboard one declared worker,
+and delegate a task over Buzz.
 
 | Tool | Behavior |
 |---|---|
 | `worker_status` | `GET /v1/workers` or `GET /v1/workers/{name}` |
 | `ensure_worker` | `PUT /v1/workers/{name}/ensure` with `{}` |
+| `onboard_worker` | `POST /v1/workers/{name}/onboard` with `{}`, once |
 | `delegate_worker` | Sign a Buzz direct message with Control's own key |
+
+`onboard_worker` submits onboarding only for a name that already exists
+on the provisioner's deployed reconciliation revision. Control cannot
+create an arbitrary worker name. The helper does not generate an
+identity and does not delegate. `ensure_worker` is not a substitute:
+ensure does not open an onboarding journal. The helper saves a
+reservation before the one POST. A later call for that name reads
+`GET /v1/workers/{name}` and does not submit again, including after a
+crash or an uncertain response. An uncertain outcome is not retried.
+A worker status document that includes an onboarding journal can be
+delegated only when that journal is `complete`. Workers with no
+onboarding journal keep the existing delegation checks.
 
 `delegate_worker` returns when the relay accepts the signed event.
 `delivery` is `relay_accepted`. That is not worker execution and not
@@ -101,7 +115,7 @@ recorded in [docs/upgrade-breaks.md](docs/upgrade-breaks.md).
 
 ## Layout
 
-`fleet-status`, `fleet-ensure`, `fleet-delegate`, and
+`fleet-status`, `fleet-ensure`, `fleet-onboard`, `fleet-delegate`, and
 `fleet-allow-inbound` are the CLI helpers. Each inserts this checkout
 on `sys.path` and nothing else. `fleet-allow-inbound` is not registered
 as an MCP tool.
