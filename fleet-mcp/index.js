@@ -1,7 +1,7 @@
 /**
  * Hermes Control Fleet MCP server.
  *
- * Tools: worker_status, ensure_worker, onboard_worker, delegate_worker.
+ * Tools: worker_status, ensure_worker, onboard_worker, delegate_worker, retire_worker.
  * There is no send_message tool. Buzz signing stays in fleet-delegate,
  * which reads the selected profile .env itself. Do not put
  * BUZZ_PRIVATE_KEY or BUZZ_FLEET_MEMBERSHIP_TOKEN in this process.
@@ -21,6 +21,7 @@ const root = path.resolve(here, "..");
 const statusBin = path.join(root, "fleet-status");
 const ensureBin = path.join(root, "fleet-ensure");
 const onboardBin = path.join(root, "fleet-onboard");
+const retireBin = path.join(root, "fleet-retire");
 const delegateBin = path.join(root, "fleet-delegate");
 
 const FORBIDDEN_ENV = [
@@ -164,6 +165,41 @@ server.registerTool(
     },
   },
   async ({ name }) => textResult(await runHelper(onboardBin, [name])),
+);
+
+server.registerTool(
+  "retire_worker",
+  {
+    description:
+      "Retire one Fleet worker by name through the provisioner deprovision route. The default call sends an empty JSON object and does not authorize a retained worker. confirm_retained true is a separate action and is the only way to send {\"confirm_retained\": true}. The helper reads the worker first, saves a reservation bound to that VM, provenance, and public key, then sends once. A later call reports status and does not send again after acceptance or an uncertain result. retry true is a separate action used only after inspecting that previous outcome. It does not send when the VM, provenance, or public key changed, and it does not authorize a retained worker. This tool does not delete onboarding reservations, delegation journals, or tombstones, and it does not send an onboarding-completion notification.",
+    inputSchema: {
+      name: z.string(),
+      confirm_retained: z.boolean().optional(),
+      retry: z.boolean().optional(),
+    },
+  },
+  async ({ name, confirm_retained, retry }) => {
+    if (confirm_retained === true && retry === true) {
+      return textResult(
+        JSON.stringify({
+          accepted: false,
+          error: {
+            code: "retire_request_invalid",
+            message: "retirement request is invalid",
+          },
+        }),
+      );
+    }
+    const payload = {};
+    if (confirm_retained === true) {
+      payload.confirm_retained = true;
+    }
+    if (retry === true) {
+      payload.retry = true;
+    }
+    const stdin = Object.keys(payload).length === 0 ? undefined : JSON.stringify(payload);
+    return textResult(await runHelper(retireBin, [name], stdin));
+  },
 );
 
 server.registerTool(

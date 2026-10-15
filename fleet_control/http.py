@@ -81,6 +81,20 @@ class FleetClient:
             raise fail("fleet_response_unsafe")
         return status, parsed
 
+    def deprovision_worker(self, name: str, *, confirm_retained: bool = False) -> tuple[int, dict[str, Any]]:
+        """POST the provisioner deprovision route.
+
+        The default body is ``{}``. ``{"confirm_retained": true}`` is sent
+        only when the caller sets that flag. Nothing is added on the
+        caller's behalf.
+        """
+        self._name(name)
+        body = b'{"confirm_retained":true}' if confirm_retained else b"{}"
+        status, parsed = self._exchange("POST", f"/v1/workers/{name}/deprovision", body)
+        if not isinstance(parsed, dict):
+            raise fail("fleet_response_unsafe")
+        return status, parsed
+
     def _name(self, name: str) -> None:
         try:
             validate_worker_name(name)

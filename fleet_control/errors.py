@@ -36,6 +36,18 @@ MESSAGES = {
     "fleet_response_unsafe": "fleet API response is unusable",
     "journal_unusable": "delegation journal is unusable",
     "onboard_journal_unusable": "onboarding journal is unusable",
+    "retained_worker": "retained worker retirement requires explicit confirmation",
+    "reconciliation_in_progress": "another reconciliation holds this worker",
+    "rename_in_progress": "a rename is in progress",
+    "coordination_retirement_refused": "coordination retirement was refused",
+    "retire_ambiguous": "retirement outcome is ambiguous",
+    "retire_in_flight": "retirement is already in flight",
+    "retire_journal_unusable": "retirement journal is unusable",
+    "retire_identity_unbound": "worker identity cannot be bound",
+    "retire_identity_changed": "retirement is bound to a different worker",
+    "retire_retry_unavailable": "retirement retry has no previous outcome",
+    "retained_confirmation_mismatch": "retained confirmation does not match this worker",
+    "retire_request_invalid": "retirement request is invalid",
     "origin_unavailable": "originating conversation is unavailable",
     "origin_invalid": "originating conversation is not a safe destination",
     "coordination_channel_invalid": "coordination channel is unusable",
@@ -48,10 +60,17 @@ MESSAGES = {
 class ControlError(Exception):
     """Fixed public failure. ``message`` must already be safe to print."""
 
-    def __init__(self, code: str, message: str, delegation_id: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        delegation_id: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
         self.code = code
         self.message = message
         self.delegation_id = delegation_id
+        self.detail = detail
         super().__init__(message)
 
     def __repr__(self) -> str:
@@ -61,14 +80,20 @@ class ControlError(Exception):
         body = {"accepted": False, "error": {"code": self.code, "message": self.message}}
         if self.delegation_id is not None:
             body["delegation_id"] = self.delegation_id
+        if self.detail is not None:
+            body["worker"] = self.detail
         return body
 
 
-def fail(code: str, delegation_id: str | None = None) -> ControlError:
+def fail(
+    code: str,
+    delegation_id: str | None = None,
+    detail: dict | None = None,
+) -> ControlError:
     """Build a public error. The message is a fixed string, not caller input."""
     try:
         message = MESSAGES[code]
     except KeyError:
         message = MESSAGES["internal_error"]
         code = "internal_error"
-    return ControlError(code, message, delegation_id)
+    return ControlError(code, message, delegation_id, detail)

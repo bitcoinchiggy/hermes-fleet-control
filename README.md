@@ -2,13 +2,14 @@
 
 Control-side Fleet MCP integration. These helpers let Hermes Control
 read worker status, ensure one worker, onboard one declared worker,
-and delegate a task over Buzz.
+retire one inspected worker, and delegate a task over Buzz.
 
 | Tool | Behavior |
 |---|---|
 | `worker_status` | `GET /v1/workers` or `GET /v1/workers/{name}` |
 | `ensure_worker` | `PUT /v1/workers/{name}/ensure` with `{}` |
 | `onboard_worker` | `POST /v1/workers/{name}/onboard` with `{}`, once |
+| `retire_worker` | `POST /v1/workers/{name}/deprovision` with `{}`, once, after a bound reservation |
 | `delegate_worker` | Sign a Buzz direct message with Control's own key |
 
 `onboard_worker` submits onboarding only for a name that already exists
@@ -22,6 +23,17 @@ crash or an uncertain response. An uncertain outcome is not retried.
 A worker status document that includes an onboarding journal can be
 delegated only when that journal is `complete`. Workers with no
 onboarding journal keep the existing delegation checks.
+
+`retire_worker` reads the worker, stores that VM, provenance, and
+public key, then posts one empty deprovision body. A retained worker
+is not retired by that call. `confirm_retained: true` is a separate
+action and is the only way to send `{"confirm_retained": true}`.
+`retry: true` is a separate action after the previous outcome has been
+inspected. It does not send when the bound identity changed, and it
+does not turn an uncertain result into another request by itself.
+Onboarding reservations, delegation journals, and tombstones stay.
+No onboarding-completion notification is sent. Placing a delegation
+result in the originating thread is follow-up work.
 
 `delegate_worker` returns when the relay accepts the signed event.
 `delivery` is `relay_accepted`. That is not worker execution and not
@@ -115,8 +127,8 @@ recorded in [docs/upgrade-breaks.md](docs/upgrade-breaks.md).
 
 ## Layout
 
-`fleet-status`, `fleet-ensure`, `fleet-onboard`, `fleet-delegate`, and
-`fleet-allow-inbound` are the CLI helpers. Each inserts this checkout
+`fleet-status`, `fleet-ensure`, `fleet-onboard`, `fleet-retire`,
+`fleet-delegate`, and `fleet-allow-inbound` are the CLI helpers. Each inserts this checkout
 on `sys.path` and nothing else. `fleet-allow-inbound` is not registered
 as an MCP tool.
 `fleet-mcp/` is the stdio MCP server. `fleet_control/` is the Python

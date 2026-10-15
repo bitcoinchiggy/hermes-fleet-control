@@ -13,6 +13,10 @@ Do not weaken Buzz mention validation. Do not add a generic message-sending tool
 
 Onboarding is `onboard_worker`, not `ensure_worker` and not `delegate_worker`. The worker must already be declared on the provisioner's deployed reconciliation revision. Control cannot create a worker name. Ensure is not a substitute. When the worker status includes an onboarding journal, delegate only after that journal is complete. Workers without an onboarding journal keep the existing checks. An uncertain onboarding result is not retried.
 
+## Retirement
+
+Retirement is `retire_worker`. The default call passes only the worker name. It does not send `confirm_retained`. A retained worker stays until a separate call sets `confirm_retained` to true. After an accepted or uncertain deprovision, another default call reports status and does not send again. `retry` true is a separate call used only after the previous outcome has been read, and only when the same VM, provenance, and public key are still present. Retirement does not delete onboarding reservations, delegation journals, or tombstones. It does not announce that onboarding completed. That notification, and placing the delegation result in the originating thread, are separate follow-up work.
+
 ## Reporting back to the human
 
 When reporting delegation or status back to the human, refer to the Fleet worker by plain name, for example operator, not @operator, unless that worker is actually a member of the current Buzz conversation and an intentional mention is required.
