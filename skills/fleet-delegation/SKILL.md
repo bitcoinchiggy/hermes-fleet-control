@@ -15,7 +15,7 @@ Onboarding is `onboard_worker`, not `ensure_worker` and not `delegate_worker`. T
 
 ## Retirement
 
-Retirement is `retire_worker`. The default call passes only the worker name. It does not send `confirm_retained`. A retained worker stays until a separate call sets `confirm_retained` to true. After an accepted or uncertain deprovision, another default call reports status and does not send again. `retry` true is a separate call used only after the previous outcome has been read, and only when the same VM, provenance, and public key are still present. Retirement does not delete onboarding reservations, delegation journals, or tombstones. It does not announce that onboarding completed. That notification, and placing the delegation result in the originating thread, are separate follow-up work.
+Retirement is `retire_worker`. The default call passes only the worker name. It does not send `confirm_retained`. A retained worker stays until a separate call sets `confirm_retained` to true. After an accepted or uncertain deprovision, another default call reports status and does not send again. An absent or tombstone view after acceptance reports completion and does not send again. `retry` true does not repeat a reserved or ambiguous attempt. It sends only after a refused retryable outcome, and only when the same name, node, VM, provenance, public key, and onboarding id are still present. Retirement does not delete onboarding reservations, delegation journals, or tombstones. It does not announce that onboarding completed. That notification, and placing the delegation result in the originating thread, are separate follow-up work.
 
 ## Reporting back to the human
 

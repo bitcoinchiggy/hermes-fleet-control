@@ -1,9 +1,10 @@
 """Submit one deprovision, then read status.
 
-The reservation is durable before the POST and stores the worker
-identity read on that call. A later call for a different VM, provenance,
-or public key does not send. An uncertain result is not sent again
-unless the caller asks for the documented retry after that outcome.
+The reservation is durable before the POST and stores the worker name,
+node, VM, provenance, public key, and onboarding id when one is present.
+A later call does not send for a different identity. A reserved or
+ambiguous attempt is not sent again. Retry posts only after a refused
+retryable outcome for that same identity.
 """
 
 from __future__ import annotations
@@ -32,9 +33,12 @@ _STATES = frozenset({"reserved", "accepted", "ambiguous", "refused"})
 _RECORD_KEYS = frozenset(
     {"worker", "state", "refusal_code", "confirm_retained", "binding", "created_at", "updated_at"}
 )
-_BINDING_KEYS = frozenset({"git_sha", "vmid", "public_key_hex", "onboarding_id"})
+_BINDING_KEYS = frozenset(
+    {"name", "git_sha", "vmid", "node", "public_key_hex", "onboarding_id"}
+)
 _STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+_NODE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ONBOARDING_ID = re.compile(r"^onb_[0-9a-f]{32}$")
 _CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -137,9 +141,11 @@ def _first(
     if retry:
         raise fail("retire_retry_unavailable")
     document = client.get_worker(name)
-    binding = _binding(name, document)
     if _terminal(document):
+        if not _worker_shape(document, name):
+            raise fail("retire_identity_unbound")
         return document
+    binding = _binding(name, document)
     if document.get("retained") is True and not confirm_retained:
         raise fail("retained_worker", detail=document)
     if confirm_retained and document.get("retained") is not True:
@@ -207,10 +213,10 @@ def _retry(
         if record["state"] != "accepted":
             _transition(directory, record, "accepted", None, token)
         return document
-    if record["state"] == "refused" and record["refusal_code"] not in _RETRYABLE:
+    if record["state"] != "refused" or record["refusal_code"] not in _RETRYABLE:
+        if record["state"] in {"reserved", "ambiguous"}:
+            raise fail("retire_ambiguous", detail=document)
         raise _stored_refusal(record, document)
-    if not _live(document):
-        raise fail("retire_identity_changed")
     record = _blank(
         record["worker"],
         "reserved",
@@ -317,15 +323,29 @@ def _binding(name: str, document: dict[str, Any]) -> dict[str, Any]:
         raise fail("retire_identity_unbound")
     if isinstance(vmid, bool) or not isinstance(vmid, int) or vmid < 1:
         raise fail("retire_identity_unbound")
+    node = _node_name(observed.get("node"))
+    if node is None:
+        raise fail("retire_identity_unbound")
     if not isinstance(public_key, str) or _HEX64.fullmatch(public_key) is None:
         raise fail("retire_identity_unbound")
     onboarding_id = _onboarding_id(document)
     return {
+        "name": name,
         "git_sha": git_sha,
         "vmid": vmid,
+        "node": node,
         "public_key_hex": public_key,
         "onboarding_id": onboarding_id,
     }
+
+
+def _node_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if _NODE.fullmatch(name) is None:
+        return None
+    return name
 
 
 def _onboarding_id(document: dict[str, Any]) -> str | None:
@@ -359,12 +379,8 @@ def _terminal(document: dict[str, Any]) -> bool:
     return isinstance(requested, dict) and requested.get("state") == "absent"
 
 
-def _live(document: dict[str, Any]) -> bool:
-    return not _terminal(document)
-
-
 def _identity_matches(binding: dict[str, Any], document: dict[str, Any]) -> bool:
-    if not isinstance(document, dict):
+    if not isinstance(document, dict) or document.get("name") != binding.get("name"):
         return False
     provenance = document.get("provenance")
     observed = document.get("observed")
@@ -374,19 +390,26 @@ def _identity_matches(binding: dict[str, Any], document: dict[str, Any]) -> bool
         return False
     public_key = observed.get("buzz_public_key_hex")
     if public_key != binding.get("public_key_hex"):
-        if not (public_key is None and _identity_may_be_absent(document)):
+        if not (public_key is None and _cleared_identity(document)):
             return False
+    node = observed.get("node")
+    if node is None:
+        if not _cleared_identity(document):
+            return False
+    elif _node_name(node) != binding.get("node"):
+        return False
     try:
         onboarding_id = _onboarding_id(document)
     except ControlError:
         return False
     bound_onboarding = binding.get("onboarding_id")
-    if onboarding_id != bound_onboarding and not (onboarding_id is None and bound_onboarding is not None):
-        return False
-    return True
+    if onboarding_id == bound_onboarding:
+        return True
+    return onboarding_id is None and bound_onboarding is not None and _terminal(document)
 
 
-def _identity_may_be_absent(document: dict[str, Any]) -> bool:
+def _cleared_identity(document: dict[str, Any]) -> bool:
+    """Absent and tombstone views drop the node and the public key."""
     if isinstance(document.get("tombstone"), dict):
         return True
     observed = document.get("observed")
@@ -556,6 +579,11 @@ def _read(directory: Path, name: str) -> dict[str, Any] | None:
     if onboarding_id is not None and (
         not isinstance(onboarding_id, str) or _ONBOARDING_ID.fullmatch(onboarding_id) is None
     ):
+        raise fail("retire_journal_unusable")
+    if binding.get("name") != name:
+        raise fail("retire_journal_unusable")
+    node = binding.get("node")
+    if not isinstance(node, str) or _NODE.fullmatch(node) is None:
         raise fail("retire_journal_unusable")
     return parsed
 

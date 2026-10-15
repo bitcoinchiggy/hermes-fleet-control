@@ -64,20 +64,28 @@ show that ref.
 Install the reviewed retirement revision beside stable Control
 `dcb3f950b142ef0a4dbd355ca7426b0172aa7d7a`. In that checkout only, run
 `python3 install-control-runtime --python /usr/bin/python3.12` after
-confirming the binary, then
-`npm ci --ignore-scripts --no-audit --no-fund` in `fleet-mcp`. Identify
-the active MCP `command`, `args`, and `cwd` from the profile
-`config.yaml` loaded by the running gateway, and
-`HERMES_FLEET_CONTROL_ROOT` from the process when it is set. Change
-only those path values. The drop-in that does so must sort after
-`fleet-delegation.conf`. Leave the profile, credentials, delegation
-journals, and onboarding reservations in place.
+confirming the binary. That creates `runtime/venv` in the new checkout
+and prints `<checkout>/runtime/venv/bin/python`. Do not point the
+gateway at the stable checkout or at a Hermes agent virtualenv, and do
+not set `FLEET_CONTROL_PYTHON` to either of those. Then, in that
+checkout's `fleet-mcp` directory, run
+`npm ci --ignore-scripts --no-audit --no-fund`. That installs
+`package-lock.json`. Do not run `npm install`. Identify the active MCP
+`command`, `args`, and `cwd` from the profile `config.yaml` loaded by
+the running gateway, and `HERMES_FLEET_CONTROL_ROOT` from the process
+when it is set. Change only those path values. Add one drop-in whose
+name sorts after `fleet-delegation.conf`, for example
+`fleet-retirement.conf`. Do not edit `fleet-delegation.conf`. Capture
+`DropInPaths` before adding it. Leave the profile, credentials,
+delegation journals, and onboarding reservations in place.
 
 Preflight with that checkout's `fleet-status` against the host trust
 store. `researcher` must return a public document.
 `control-onboard-check` must show the same VM 1037, public key,
-onboarding id, and generation 1 alias, with `retained` false. Stop if
-the client reports `fleet_unreachable`.
+onboarding id, and generation 1 alias, with `retained` false. Record
+`observed.node` from that document. It has to be present; the
+reservation binds that node with the name, VM, provenance, public key,
+and onboarding id. Stop if the client reports `fleet_unreachable`.
 
 Call `retire_worker` once with only the name. The body is `{}`. Do not
 pass `confirm_retained`. Use named `worker_status` afterward. One
@@ -87,13 +95,20 @@ the VM and both aliases, and remove coordination membership. Control's
 onboarding reservation and the delegation journal stay. A later
 `retire_worker` call reports status and does not send again.
 
-`retry` is a separate call used only after a human reads an uncertain
-previous outcome and the live identity still matches. It is not part
-of the first attempt.
+`retry` is not part of the first attempt. It does not send again while
+the attempt is reserved or ambiguous. It sends only after a refused
+retryable outcome and only when that same node, VM, provenance, public
+key, and onboarding id are still present. An absent or tombstone view
+reports completion and does not send.
 
-Restore the captured Control paths and the captured provisioner
-`ExecStart`. Restart only those two services. Porcelain, including
-`tls-backend.new.crt`, matches the baseline. Stable Fleet and stable
-Control match the revisions above. Template 1000, existing agents,
-retained backups, and the preflight inventory stay. The new tombstone
-and the retired onboarding journal stay.
+Rollback changes only the validation settings. Remove the new drop-in
+and leave `fleet-delegation.conf` as captured. Restore the captured
+MCP `command`, `args`, `cwd`, and `HERMES_FLEET_CONTROL_ROOT` strings.
+Restore the captured provisioner `ExecStart`. If
+`FLEET_PROVISIONER_GIT_REF` was absent before the prefix, require it
+to be absent again. Restart only the provisioner and the one Control
+gateway. Porcelain, including `tls-backend.new.crt`, matches the
+baseline. Stable Fleet and stable Control match the revisions above.
+Template 1000, existing agents, retained backups, and the preflight
+inventory stay. The new tombstone, the retired onboarding journal, the
+Control onboarding reservation, and the delegation journal stay.

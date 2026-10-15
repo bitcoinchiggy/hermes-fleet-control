@@ -38,6 +38,7 @@ def worker(**overrides) -> dict:
     observed = {
         "state": "ready",
         "vmid": 1037,
+        "node": "node-a",
         "buzz_public_key_hex": KEY,
     }
     observed.update(overrides.pop("observed", {}))
@@ -66,6 +67,19 @@ def accepted(**overrides) -> dict:
     body.pop("onboarding", None)
     body.update(overrides)
     return body
+
+
+def tombstone_view() -> dict:
+    return worker(
+        requested={"state": "absent"},
+        observed={
+            "state": "absent",
+            "vmid": 1037,
+            "node": None,
+            "buzz_public_key_hex": None,
+        },
+        tombstone={"name": "control-onboard-check", "vmid": 1037, "git_sha": SHA},
+    )
 
 
 def refusal(code: str) -> dict:
@@ -125,7 +139,10 @@ class RetireTests(unittest.TestCase):
         self.assertEqual(self.record()["binding"]["git_sha"], SHA)
         self.assertEqual(self.record()["binding"]["public_key_hex"], KEY)
         self.assertEqual(self.record()["binding"]["onboarding_id"], ONB)
+        self.assertEqual(self.record()["binding"]["node"], "node-a")
+        self.assertEqual(self.record()["binding"]["name"], "control-onboard-check")
         self.assertFalse(self.record()["confirm_retained"])
+        self.assertEqual(stat.S_IMODE(self.journal.stat().st_mode), 0o700)
         second = self.retire(transport)
         self.assertEqual(second["observed"]["state"], "deprovisioning")
         self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
@@ -149,6 +166,7 @@ class RetireTests(unittest.TestCase):
         self.assertIn('"state":"reserved"', seen["journal"])
         self.assertIn(SHA, seen["journal"])
         self.assertIn(KEY, seen["journal"])
+        self.assertIn("node-a", seen["journal"])
         self.assertEqual(seen["body"], b"{}")
 
     def test_refused_reconciliation_is_not_sent_again(self):
@@ -169,15 +187,42 @@ class RetireTests(unittest.TestCase):
         self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
         self.assertEqual(self.record()["state"], "refused")
 
-    def test_explicit_retry_after_an_ambiguous_post_sends_once(self):
-        transport = Scripted([(200, worker()), TimeoutError(), (200, worker()), (202, accepted())])
+    def test_explicit_retry_of_an_ambiguous_post_does_not_send(self):
+        transport = Scripted([(200, worker()), TimeoutError(), (200, worker())])
         with self.assertRaises(ControlError) as caught:
             self.retire(transport)
         self.assertEqual(caught.exception.code, "retire_ambiguous")
-        self.retire(transport, retry=True)
-        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET", "POST"])
-        self.assertEqual(transport.calls[3][3], b"{}")
-        self.assertEqual(self.record()["state"], "accepted")
+        with self.assertRaises(ControlError) as again:
+            self.retire(transport, retry=True)
+        self.assertEqual(again.exception.code, "retire_ambiguous")
+        self.assertEqual(again.exception.detail["observed"]["vmid"], 1037)
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+        self.assertEqual(self.record()["state"], "ambiguous")
+
+    def test_retry_does_not_confirm_a_retained_refusal(self):
+        transport = Scripted(
+            [
+                (200, worker()),
+                (409, refusal("retained_worker")),
+                (200, worker(retained=True)),
+            ]
+        )
+        with self.assertRaises(ControlError) as caught:
+            self.retire(transport)
+        self.assertEqual(caught.exception.code, "retained_worker")
+        self.assertFalse(self.record()["confirm_retained"])
+        with self.assertRaises(ControlError) as again:
+            self.retire(transport, retry=True)
+        self.assertEqual(again.exception.code, "retained_worker")
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+        self.assertFalse(self.record()["confirm_retained"])
+
+    def test_already_absent_worker_does_not_post(self):
+        transport = Scripted([(200, tombstone_view())])
+        body = self.retire(transport)
+        self.assertEqual(body["observed"]["state"], "absent")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+        self.assertFalse((self.journal / "control-onboard-check.json").exists())
 
     def test_explicit_retry_sends_once_after_inspection(self):
         transport = Scripted(
@@ -280,6 +325,21 @@ class RetireTests(unittest.TestCase):
         self.assertEqual([call[0] for call in follow.calls], ["GET"])
         self.assertEqual(self.record()["state"], "reserved")
 
+    def test_explicit_retry_of_a_reserved_attempt_does_not_send(self):
+        def crash(method, url, headers, payload):
+            if method == "GET":
+                return 200, json.dumps(worker()).encode("utf-8")
+            raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.retire(crash)
+        follow = Scripted([(200, worker())])
+        with self.assertRaises(ControlError) as caught:
+            self.retire(follow, retry=True)
+        self.assertEqual(caught.exception.code, "retire_ambiguous")
+        self.assertEqual([call[0] for call in follow.calls], ["GET"])
+        self.assertEqual(self.record()["state"], "reserved")
+
     def test_timeout_malformed_and_ambiguous_responses_are_not_retried(self):
         cases = {
             "timeout": TimeoutError(),
@@ -338,6 +398,106 @@ class RetireTests(unittest.TestCase):
             self.retire(follow, retry=True)
         self.assertEqual(caught.exception.code, "retire_identity_changed")
         self.assertEqual([call[0] for call in follow.calls], ["GET"])
+
+    def test_accepted_then_tombstone_reports_completion_without_post(self):
+        transport = Scripted([(200, worker()), (202, accepted()), (200, tombstone_view())])
+        self.retire(transport)
+        body = self.retire(transport)
+        self.assertEqual(body["observed"]["state"], "absent")
+        self.assertEqual(body["tombstone"]["vmid"], 1037)
+        self.assertIsNone(body["observed"]["node"])
+        self.assertIsNone(body["observed"]["buzz_public_key_hex"])
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+        self.assertEqual(self.record()["state"], "accepted")
+
+    def test_retry_reports_a_tombstone_without_posting(self):
+        transport = Scripted([(200, worker()), TimeoutError(), (200, tombstone_view())])
+        with self.assertRaises(ControlError) as caught:
+            self.retire(transport)
+        self.assertEqual(caught.exception.code, "retire_ambiguous")
+        body = self.retire(transport, retry=True)
+        self.assertEqual(body["observed"]["state"], "absent")
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+        self.assertEqual(self.record()["state"], "accepted")
+
+    def test_missing_or_malformed_identity_does_not_post(self):
+        cases = {
+            "node": worker(observed={"node": None}),
+            "blank-node": worker(observed={"node": " "}),
+            "bad-node": worker(observed={"node": "../node"}),
+            "key": worker(observed={"buzz_public_key_hex": None}),
+            "vmid": worker(observed={"vmid": True}),
+            "sha": worker(provenance={"git_sha": "abc"}),
+            "onboarding": worker(onboarding={"id": "onb_short"}),
+            "onboarding-shape": worker(onboarding="complete"),
+        }
+        for label, body in cases.items():
+            with self.subTest(label=label):
+                self.journal = Path(self.tmp.name) / label
+                transport = Scripted([(200, body)])
+                with self.assertRaises(ControlError) as caught:
+                    self.retire(transport)
+                self.assertEqual(caught.exception.code, "retire_identity_unbound")
+                self.assertEqual([call[0] for call in transport.calls], ["GET"])
+                self.assertFalse((self.journal / "control-onboard-check.json").exists())
+
+    def test_different_node_is_not_the_same_worker(self):
+        transport = Scripted(
+            [
+                (200, worker()),
+                (202, accepted()),
+                (200, worker(observed={"node": "node-b"})),
+            ]
+        )
+        self.retire(transport)
+        with self.assertRaises(ControlError) as caught:
+            self.retire(transport)
+        self.assertEqual(caught.exception.code, "retire_identity_changed")
+        self.assertEqual(self.record()["binding"]["node"], "node-a")
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+
+    def test_missing_onboarding_on_a_live_worker_is_a_different_worker(self):
+        live = worker()
+        live.pop("onboarding")
+        transport = Scripted([(200, worker()), (202, accepted()), (200, live)])
+        self.retire(transport)
+        with self.assertRaises(ControlError) as caught:
+            self.retire(transport)
+        self.assertEqual(caught.exception.code, "retire_identity_changed")
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+
+    def test_established_worker_without_onboarding_posts_once(self):
+        established = worker()
+        established.pop("onboarding")
+        transport = Scripted([(200, established), (202, accepted()), (200, accepted())])
+        self.retire(transport)
+        self.assertIsNone(self.record()["binding"]["onboarding_id"])
+        self.assertEqual(self.record()["binding"]["node"], "node-a")
+        self.retire(transport)
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+
+    def test_onboarding_appearing_later_is_a_different_worker(self):
+        established = worker()
+        established.pop("onboarding")
+        transport = Scripted([(200, established), (202, accepted()), (200, worker())])
+        self.retire(transport)
+        with self.assertRaises(ControlError) as caught:
+            self.retire(transport)
+        self.assertEqual(caught.exception.code, "retire_identity_changed")
+        self.assertIsNone(self.record()["binding"]["onboarding_id"])
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+
+    def test_symlink_journal_is_refused(self):
+        self.journal.mkdir()
+        outside = Path(self.tmp.name) / "other.json"
+        outside.write_text("{}")
+        (self.journal / "control-onboard-check.json").symlink_to(outside)
+        transport = Scripted([(200, worker())])
+        with self.assertRaises(ControlError) as caught:
+            self.retire(transport)
+        self.assertEqual(caught.exception.code, "retire_journal_unusable")
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(outside.read_text(), "{}")
 
     def test_undeclared_name_does_not_post(self):
         transport = Scripted([(404, refusal("undeclared_worker"))])
@@ -434,6 +594,10 @@ class RetireTests(unittest.TestCase):
         self.assertIn("FLEET-CONTROL-ONBOARD-CHECK-20261015-01", observation)
         self.assertIn("separate DM", observation)
         self.assertIn("not authorization to run", observation)
+        self.assertIn("runtime/venv", observation)
+        self.assertIn("package-lock.json", observation)
+        self.assertIn("fleet-retirement.conf", observation)
+        self.assertIn("does not send again while", observation)
 
 
 if __name__ == "__main__":

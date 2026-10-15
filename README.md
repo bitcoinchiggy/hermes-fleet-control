@@ -24,13 +24,14 @@ A worker status document that includes an onboarding journal can be
 delegated only when that journal is `complete`. Workers with no
 onboarding journal keep the existing delegation checks.
 
-`retire_worker` reads the worker, stores that VM, provenance, and
-public key, then posts one empty deprovision body. A retained worker
-is not retired by that call. `confirm_retained: true` is a separate
-action and is the only way to send `{"confirm_retained": true}`.
-`retry: true` is a separate action after the previous outcome has been
-inspected. It does not send when the bound identity changed, and it
-does not turn an uncertain result into another request by itself.
+`retire_worker` reads the worker, stores that name, node, VM,
+provenance, public key, and onboarding id when one is present, then
+posts one empty deprovision body. A retained worker is not retired by
+that call. `confirm_retained: true` is a separate action and is the
+only way to send `{"confirm_retained": true}`. `retry: true` does not
+repeat a reserved or ambiguous attempt. It sends only after a refused
+retryable outcome for the same identity. An absent or tombstone view
+after acceptance reports completion and does not send again.
 Onboarding reservations, delegation journals, and tombstones stay.
 No onboarding-completion notification is sent. Placing a delegation
 result in the originating thread is follow-up work.
