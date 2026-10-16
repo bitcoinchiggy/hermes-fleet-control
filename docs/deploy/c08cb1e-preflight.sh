@@ -591,8 +591,8 @@ def main() -> None:
         out("gateway-FLEET_PROVISIONER_GIT_REF=unknown")
         out("mcp-config=unknown")
         out("skill-load=unknown")
-    proxmox = Path("/etc/pve").is_dir() and shutil.which("qm") is not None
-    out("proxmox-signals=" + ("present" if proxmox else "absent"))
+    guest_node = Path("/etc/pve").is_dir() and shutil.which("qm") is not None
+    out("guest-node-signals=" + ("present" if guest_node else "absent"))
     if system_state == "loaded":
         report_gateway("system", False)
     if user_state == "loaded":
@@ -628,8 +628,8 @@ def main() -> None:
     roles = []
     if system_state == "loaded" or user_state == "loaded":
         roles.append("control")
-    if proxmox:
-        roles.append("proxmox")
+    if guest_node:
+        roles.append("guest-node")
     if provisioner_units():
         roles.append("provisioner")
     out("roles-on-this-host=" + (",".join(roles) if roles else "none"))

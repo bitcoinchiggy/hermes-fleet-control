@@ -117,7 +117,7 @@ Not read from a host. Commands stop when a check fails.
   `/var/lib/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`
   as root, else
   `$HOME/.local/state/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`.
-  Provisioner and Proxmox witnesses are `/var/lib/hermes-control-deploy/`
+  Provisioner and guest-node witnesses are `/var/lib/hermes-control-deploy/`
   and those pastes run as root. New directories, not profile journals.
 
 ## Open questions
@@ -241,7 +241,7 @@ print(f"host-role=Provisioner hostname={os.uname().nodename}")
 if os.geteuid() != 0:
     die("run this command as root on the Provisioner")
 if Path("/etc/pve").is_dir() and __import__("shutil").which("qm"):
-    die("this host looks like the Proxmox node")
+    die("this host looks like the guest node")
 control = subprocess.run(
     ["systemctl", "show", "-p", "LoadState", "--value", "hermes-gateway-control.service"],
     capture_output=True,
@@ -359,14 +359,15 @@ PY
 BASH
 ```
 
-## 3. Proxmox — VM inventory
+## 3. Guest node — VM inventory
 
-On the Proxmox node, as root. Does not start, stop, or destroy a guest.
+On the guest node, as root. That host is the one where `qm` and
+`/etc/pve` are present. Does not start, stop, or destroy a guest.
 Steps 9 and 13 run this same command.
 
 ```bash
 bash -euo pipefail <<'BASH'
-echo "host-role=Proxmox hostname=$(hostname -s)"
+echo "host-role=guest-node hostname=$(hostname -s)"
 test "$(id -u)" -eq 0
 command -v qm >/dev/null
 test -d /etc/pve
@@ -374,7 +375,7 @@ if [[ "$(systemctl show -p LoadState --value hermes-gateway-control.service 2>/d
   echo "STOP: hermes-gateway-control.service is loaded on this host" >&2
   exit 1
 fi
-EVIDENCE=/var/lib/hermes-control-deploy/c08cb1e-proxmox-witness
+EVIDENCE=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness
 mkdir -p -- "$EVIDENCE"
 chmod 700 -- "$EVIDENCE"
 exec 9>"$EVIDENCE/lock"
@@ -396,7 +397,7 @@ else
   cmp -s -- "$EVIDENCE/qm-now.txt" "$EVIDENCE/qm-baseline.txt"
   echo "baseline=matched lines=$(wc -l < "$EVIDENCE/qm-baseline.txt")"
 fi
-echo "PROXMOX OK"
+echo "GUEST-NODE OK"
 BASH
 ```
 
@@ -512,7 +513,7 @@ Print `STEP 7 OK`.
 
 Run the step 2 command again. Require `baseline=matched`.
 
-## 9. Proxmox — inventory unchanged
+## 9. Guest node — inventory unchanged
 
 Run the step 3 command again. Require `baseline=matched`.
 
@@ -550,6 +551,6 @@ Print `STEP 11 OK`.
 
 Run the step 2 command again.
 
-## 13. Proxmox — still unchanged
+## 13. Guest node — still unchanged
 
 Run the step 3 command again.
