@@ -910,8 +910,14 @@ class DelegateTests(unittest.TestCase):
 class McpSourceTests(unittest.TestCase):
     def test_server_exposes_only_the_fleet_tools(self):
         text = (REPO / "fleet-mcp" / "index.js").read_text()
-        self.assertEqual(text.count("server.registerTool("), 4)
-        for name in ("worker_status", "ensure_worker", "onboard_worker", "delegate_worker"):
+        self.assertEqual(text.count("server.registerTool("), 5)
+        for name in (
+            "worker_status",
+            "ensure_worker",
+            "onboard_worker",
+            "retire_worker",
+            "delegate_worker",
+        ):
             self.assertIn(name, text)
         self.assertNotIn('registerTool(\n  "send_message"', text)
         self.assertNotIn("delegate_task", text)
