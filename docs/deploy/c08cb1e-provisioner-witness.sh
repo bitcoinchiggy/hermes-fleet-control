@@ -7,4 +7,9 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 here=$(cd "$(dirname "$0")" && pwd)
-exec python3 "$here/c08cb1e_material.py" provisioner-witness
+py=/usr/bin/python3.12
+if [[ ! -x $py ]]; then
+  echo "STOP: /usr/bin/python3.12 is missing" >&2
+  exit 1
+fi
+exec "$py" "$here/c08cb1e_material.py" provisioner-witness

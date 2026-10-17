@@ -5,7 +5,10 @@ from __future__ import annotations
 import importlib.util
 import os
 import stat
+import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -146,30 +149,176 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertEqual(material.control_journal_dir(env, "onboarding"), onboard_resolve(env, None))
             self.assertEqual(material.control_journal_dir(env, "retirements"), retire_resolve(env, None))
 
-    def test_ready_exit_is_not_a_pass_for_unknowns(self):
-        facts = {
+    def _ready_facts(self) -> dict[str, str]:
+        return {
             "hostname": "control",
             "unit-scope": "system",
             "system-active": "active",
             "system-process": "live",
             "system-FLEET_CONTROL_PYTHON": "absent",
             "system-HERMES_FLEET_CONTROL_INTEGRATION": "1",
-            "system-mcp-command": "absolute-checkout:/opt/hermes-fleet-control/dcb3f950/fleet-mcp",
+            "system-mcp-command": "absolute-checkout:/opt/hermes-fleet-control/dcb3f950b142ef0a4dbd355ca7426b0172aa7d7a/fleet-mcp",
             "system-mcp-cwd": "interpolated",
-            "system-mcp-args": "public:node,redacted",
+            "system-mcp-args": "absent",
             "system-skill-load": "home-skills",
             "stable-dir-count": "1",
             "stable-head-is-dcb3f950": "yes",
-            "origin-embedded-token": "unknown",
+            "origin-embedded-token": "absent",
             "guest-node-signals": "absent",
             "provisioner-on-host": "no",
         }
+
+    def test_ready_exit_is_not_a_pass_for_unknowns(self):
+        facts = self._ready_facts()
+        facts["origin-embedded-token"] = "unknown"
         blockers = material.host_ready_blockers(facts)
         self.assertIn("origin-embedded-token", blockers)
         self.assertEqual(material.preflight_exit(blockers), 4)
         facts["origin-embedded-token"] = "absent"
         self.assertEqual(material.host_ready_blockers(facts), [])
         self.assertEqual(material.preflight_exit([]), 0)
+
+    def test_redacted_mcp_args_are_not_configuration_validation(self):
+        hidden = material.classify_mcp_args(
+            ["node", "--token", "sk-test-value", "--password", "nsec1qqqqqqqqqqqqqq", "Bearer test-token"]
+        )
+        self.assertNotIn("sk-test-value", hidden)
+        self.assertNotIn("nsec1qqqqqqqqqqqqqq", hidden)
+        self.assertNotIn("Bearer", hidden)
+        self.assertIn("redacted", hidden.split(","))
+        self.assertFalse(material.mcp_args_configuration_ok(hidden))
+        facts = self._ready_facts()
+        facts["system-mcp-args"] = hidden
+        blockers = material.host_ready_blockers(facts)
+        self.assertEqual(blockers, ["system-mcp-args"])
+        self.assertEqual(material.preflight_exit(blockers), 4)
+        validated = material.classify_mcp_args(
+            [
+                "node",
+                "--version",
+                "${HERMES_FLEET_CONTROL_ROOT}/fleet-mcp/index.js",
+                "/opt/hermes-fleet-control/dcb3f950b142ef0a4dbd355ca7426b0172aa7d7a/fleet-mcp/index.js",
+            ]
+        )
+        self.assertTrue(material.mcp_args_configuration_ok(validated))
+        facts["system-mcp-args"] = validated
+        self.assertEqual(material.host_ready_blockers(facts), [])
+        self.assertFalse(material.mcp_args_configuration_ok("public:sk-test-value"))
+        self.assertFalse(material.mcp_args_configuration_ok("flag:--token"))
+
+    def test_runbook_commands_match_executable_entry_points(self):
+        plan = (ROOT / "docs" / "deploy" / "c08cb1e-deploy-plan.md").read_text(encoding="utf-8")
+        blocks: list[str] = []
+        capture = False
+        chunk: list[str] = []
+        for line in plan.splitlines():
+            if line.startswith("```"):
+                if capture:
+                    blocks.append("\n".join(chunk))
+                    chunk = []
+                capture = not capture
+                continue
+            if capture:
+                chunk.append(line)
+        commands = [line.strip() for block in blocks for line in block.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(commands), 9)
+        for command in commands:
+            path_text, _, verb = command.partition(" ")
+            path = ROOT / path_text
+            self.assertTrue(path.is_file(), command)
+            self.assertTrue(os.access(path, os.X_OK), command)
+            if path.name == "c08cb1e_material.py":
+                self.assertIn(verb, material.COMMANDS)
+                self.assertTrue(path.read_text(encoding="utf-8").startswith("#!/usr/bin/python3.12\n"))
+            else:
+                self.assertEqual(verb, "")
+                self.assertIn(path.name, {
+                    "c08cb1e-preflight.sh",
+                    "c08cb1e-provisioner-witness.sh",
+                    "c08cb1e-guest-node-witness.sh",
+                })
+                if path.name != "c08cb1e-guest-node-witness.sh":
+                    wrapper = path.read_text(encoding="utf-8")
+                    self.assertIn("py=/usr/bin/python3.12", wrapper)
+                    self.assertNotIn("\npy=python3\n", wrapper)
+        usage = subprocess.run(
+            [str(ROOT / "docs" / "deploy" / "c08cb1e_material.py")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(usage.returncode, 2)
+        for name in material.COMMANDS:
+            self.assertIn(name, usage.stderr)
+        self.assertEqual(material.main(["c08cb1e_material.py", "not-a-command"]), 2)
+        for wrapper in ("c08cb1e-preflight.sh", "c08cb1e-provisioner-witness.sh"):
+            refused = subprocess.run(
+                ["bash", str(ROOT / "docs" / "deploy" / wrapper), "extra"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(refused.returncode, 2, wrapper)
+            self.assertIn("STOP:", refused.stderr)
+
+    def test_guest_node_witness_names_its_host_writes(self):
+        witness = ROOT / "docs" / "deploy" / "c08cb1e-guest-node-witness.sh"
+        stub = Path(tempfile.mkdtemp())
+        (stub / "qm").write_text(
+            "#!/bin/sh\necho 'VMID NAME STATUS'\necho '101 alpha running'\necho '102 beta stopped'\n",
+            encoding="utf-8",
+        )
+        (stub / "systemctl").write_text("#!/bin/sh\necho not-found\nexit 0\n", encoding="utf-8")
+        os.chmod(stub / "qm", 0o755)
+        os.chmod(stub / "systemctl", 0o755)
+        path = str(stub) + ":" + os.environ["PATH"]
+        inner = textwrap.dedent(
+            f"""\
+            set -euo pipefail
+            saved=$(mktemp -d)
+            out=$(mktemp -d)
+            mount --bind /etc/alternatives "$saved"
+            newetc=$(mktemp -d)
+            mount -t tmpfs tmpfs "$newetc"
+            mount --bind "$newetc" /etc
+            mkdir -p /etc/pve /etc/alternatives
+            mount --bind "$saved" /etc/alternatives
+            mount -t tmpfs tmpfs /var/lib
+            export PATH={path}
+            bash {witness} > "$out/first.out"
+            echo first-baseline=$(stat -c %a /var/lib/hermes-control-deploy/c08cb1e-guest-node-witness/qm-baseline.txt)
+            echo first-dir=$(stat -c %a /var/lib/hermes-control-deploy/c08cb1e-guest-node-witness)
+            echo first-lock=$(stat -c %a /var/lib/hermes-control-deploy/c08cb1e-guest-node-witness/lock)
+            cp /var/lib/hermes-control-deploy/c08cb1e-guest-node-witness/qm-baseline.txt "$out/baseline.txt"
+            bash {witness} > "$out/second.out"
+            cmp -s "$out/baseline.txt" /var/lib/hermes-control-deploy/c08cb1e-guest-node-witness/qm-baseline.txt
+            echo baseline-unchanged=yes
+            cat "$out/first.out"
+            echo '--- second ---'
+            cat "$out/second.out"
+            """
+        )
+        completed = subprocess.run(
+            ["unshare", "--user", "--mount", "--map-root-user", "bash", "-c", inner],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("host-mutation=yes", completed.stdout)
+        self.assertIn("read-only=no", completed.stdout)
+        self.assertIn("mutation-dir=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness mode=0700", completed.stdout)
+        self.assertIn("mutation-file=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness/lock action=create-or-truncate", completed.stdout)
+        self.assertIn("mutation-file=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness/qm-now.txt action=replace", completed.stdout)
+        self.assertIn("mutation-file=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness/qm-baseline.txt action=create-once-then-compare mode=0600", completed.stdout)
+        self.assertIn("guests=not-started-stopped-or-destroyed", completed.stdout)
+        self.assertIn("baseline=created lines=2", completed.stdout)
+        self.assertIn("baseline=matched lines=2", completed.stdout)
+        self.assertIn("first-dir=700", completed.stdout)
+        self.assertIn("first-baseline=600", completed.stdout)
+        self.assertIn("baseline-unchanged=yes", completed.stdout)
+        self.assertNotIn("read-only=yes", completed.stdout)
+        self.assertFalse(Path("/var/lib/hermes-control-deploy").exists())
 
     def test_config_rewrite_and_atomic_replace(self):
         import tempfile

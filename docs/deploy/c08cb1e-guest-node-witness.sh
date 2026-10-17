@@ -1,8 +1,20 @@
 #!/bin/bash
-# Guest-node VM inventory. The host is the one where qm and /etc/pve
-# are present. Does not start, stop, or destroy a guest.
+# Guest-node VM inventory. This is a host mutation, not a read-only
+# diagnostic. It does not start, stop, or destroy a guest.
+#
+# Every run, as root:
+# - creates /var/lib/hermes-control-deploy/c08cb1e-guest-node-witness
+#   if missing, then sets that directory to mode 0700
+# - creates or truncates lock in that directory and takes a non-blocking flock
+# - replaces qm-now.txt with VMID and status rows from `qm list`
+# The first run copies qm-now.txt to qm-baseline.txt and sets mode 0600.
+# Later runs compare the two files and do not replace the baseline.
+# lock and qm-now.txt keep the shell redirection mode (umask). The
+# directory mode keeps them private to root.
 set -euo pipefail
 echo "host-role=guest-node hostname=$(hostname -s)"
+echo "host-mutation=yes"
+echo "read-only=no"
 test "$(id -u)" -eq 0
 command -v qm >/dev/null
 test -d /etc/pve
@@ -11,6 +23,11 @@ if [[ "$(systemctl show -p LoadState --value hermes-gateway-control.service 2>/d
   exit 1
 fi
 EVIDENCE=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness
+echo "mutation-dir=$EVIDENCE mode=0700"
+echo "mutation-file=$EVIDENCE/lock action=create-or-truncate"
+echo "mutation-file=$EVIDENCE/qm-now.txt action=replace"
+echo "mutation-file=$EVIDENCE/qm-baseline.txt action=create-once-then-compare mode=0600"
+echo "guests=not-started-stopped-or-destroyed"
 mkdir -p -- "$EVIDENCE"
 chmod 700 -- "$EVIDENCE"
 exec 9>"$EVIDENCE/lock"

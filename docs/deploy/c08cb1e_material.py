@@ -1,9 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.12
 """Reviewed helpers for the c08cb1e Control deploy.
 
 The shell entry points in this directory call this file. It does not
-contact another machine. Mutating commands write only the evidence
-directory, the new checkout, the gateway drop-in, and config.yaml.
+contact another machine. Preflight only reads. baseline, install,
+configure, restart, and rollback write the evidence directory, the new
+checkout, the gateway drop-in, or config.yaml. provisioner-witness
+creates /var/lib/hermes-control-deploy/c08cb1e-provisioner-witness.
+The guest-node shell script is a separate host mutation.
 """
 
 from __future__ import annotations
@@ -412,6 +415,37 @@ def atomic_replace(path: Path, payload: bytes, *, mode: int | None = None) -> No
     os.replace(tmp, path)
 
 
+def mcp_args_configuration_ok(value: str) -> bool:
+    """True only for argument shapes the diagnostic can validate.
+
+    `redacted` is safe to print. It does not show that the hidden text is
+    the right configuration, so it is not a host-ready argument.
+    """
+    if value == "absent":
+        return True
+    if not value:
+        return False
+    for part in value.split(","):
+        if part in {"interpolated", "absent"}:
+            continue
+        if part.startswith("absolute-checkout:"):
+            if CHECKOUT_RE.fullmatch(part.removeprefix("absolute-checkout:")):
+                continue
+            return False
+        if part.startswith("public:"):
+            if part.removeprefix("public:") in PUBLIC_MCP:
+                continue
+            return False
+        if part.startswith("flag:"):
+            flag = part.removeprefix("flag:")
+            if CREDENTIAL_FLAG_RE.match(flag):
+                return False
+            if SAFE_FLAG_RE.fullmatch(flag):
+                continue
+        return False
+    return True
+
+
 def host_ready_blockers(facts: dict[str, str]) -> list[str]:
     """Unknown and missing prerequisites are blockers, not passes."""
     blockers: list[str] = []
@@ -426,17 +460,6 @@ def host_ready_blockers(facts: dict[str, str]) -> list[str]:
     def checkout_or_interpolated(value: str) -> bool:
         return value == "interpolated" or value.startswith("absolute-checkout:")
 
-    def args_classified(value: str) -> bool:
-        if value == "absent":
-            return True
-        for part in value.split(","):
-            if part == "redacted" or part == "interpolated" or part == "absent":
-                continue
-            if part.startswith("public:") or part.startswith("flag:") or part.startswith("absolute-checkout:"):
-                continue
-            return False
-        return True
-
     need("hostname", lambda value: value not in {"", "unknown"})
     need("unit-scope", lambda value: value in {"system", "user"})
     scope = facts.get("unit-scope")
@@ -447,7 +470,7 @@ def host_ready_blockers(facts: dict[str, str]) -> list[str]:
         need(f"{scope}-HERMES_FLEET_CONTROL_INTEGRATION", lambda value: value == "1")
         need(f"{scope}-mcp-command", checkout_or_interpolated)
         need(f"{scope}-mcp-cwd", checkout_or_interpolated)
-        need(f"{scope}-mcp-args", args_classified)
+        need(f"{scope}-mcp-args", mcp_args_configuration_ok)
         need(
             f"{scope}-skill-load",
             lambda value: value
@@ -485,6 +508,11 @@ def _self_check() -> None:
     assert classify_mcp_args(["--token", "sk-test-value"]) == "flag:--token,redacted"
     assert classify_mcp_args(["--password", "hunter2"]) == "flag:--password,redacted"
     assert classify_mcp_args(["--token", "node"]) == "flag:--token,redacted"
+    assert mcp_args_configuration_ok("absent")
+    assert mcp_args_configuration_ok("public:node,flag:--version,interpolated")
+    assert not mcp_args_configuration_ok("public:node,redacted")
+    assert not mcp_args_configuration_ok("flag:--token,redacted")
+    assert not mcp_args_configuration_ok("flag:--token")
     decision = "\n".join(report_origin_decision("https://user:sk-test-value@example.test/org/repo.git"))
     assert "origin-embedded-token=present" in decision
     assert "origin-copied=no" in decision
@@ -726,6 +754,7 @@ def cmd_preflight() -> int:
 
     out("preflight=c08cb1e-control")
     out("read-only=yes")
+    out("mcp-args-note=redacted-is-not-configuration-validation")
     out("other-hosts=not-contacted")
     out("nrestarts-measures=" + NRESTARTS_MEASURES)
     code, short = _run(["hostname", "-s"])
@@ -961,7 +990,11 @@ def _report_provisioner(facts: dict[str, str]) -> None:
 
 
 def cmd_provisioner_witness() -> int:
-    """Read-only except the witness directory. State bodies are not printed."""
+    """Host mutation. Creates the witness directory (mode 0700) and, on
+    the first run, witness.manifest and identity (mode 0600). Later runs
+    still chmod the directory and compare those files. State bodies are
+    not printed.
+    """
     if os.geteuid() != 0:
         die("run this command as root on the Provisioner")
     if Path("/etc/pve").is_dir() and shutil.which("qm"):
@@ -1522,23 +1555,25 @@ def _cwd_under(pid: int, root: Path) -> bool:
     return False
 
 
+COMMANDS = {
+    "preflight": cmd_preflight,
+    "baseline": cmd_baseline,
+    "provisioner-witness": cmd_provisioner_witness,
+    "install": cmd_install,
+    "configure": cmd_configure,
+    "restart": cmd_restart,
+    "verify": cmd_verify,
+    "rollback": cmd_rollback,
+    "confirm": cmd_confirm,
+}
+
+
 def main(argv: list[str]) -> int:
-    commands = {
-        "preflight": cmd_preflight,
-        "baseline": cmd_baseline,
-        "provisioner-witness": cmd_provisioner_witness,
-        "install": cmd_install,
-        "configure": cmd_configure,
-        "restart": cmd_restart,
-        "verify": cmd_verify,
-        "rollback": cmd_rollback,
-        "confirm": cmd_confirm,
-    }
-    if len(argv) != 2 or argv[1] not in commands:
-        sys.stderr.write("STOP: usage: c08cb1e_material.py " + "|".join(commands) + "\n")
+    if len(argv) != 2 or argv[1] not in COMMANDS:
+        sys.stderr.write("STOP: usage: c08cb1e_material.py " + "|".join(COMMANDS) + "\n")
         return 2
     try:
-        return commands[argv[1]]()
+        return COMMANDS[argv[1]]()
     except Stop:
         return 1
     except Exception as exc:

@@ -12,6 +12,7 @@ fi
 here=$(cd "$(dirname "$0")" && pwd)
 py=/usr/bin/python3.12
 if [[ ! -x $py ]]; then
-  py=python3
+  echo "STOP: /usr/bin/python3.12 is missing" >&2
+  exit 1
 fi
 exec "$py" "$here/c08cb1e_material.py" preflight

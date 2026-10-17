@@ -9,7 +9,14 @@ values are not printed.
 The commands live in this branch's `docs/deploy/`. They are not in the
 `dcb3f950` tree or the `c08cb1e` tree. Copy this `docs/deploy/` directory
 onto the host that will run the command. Do not take the helpers from
-the checkout being deployed.
+the checkout being deployed. Run the commands from the directory that
+contains that copied `docs/deploy/` folder, so the paths below resolve.
+The scripts are mode `0755`. `c08cb1e_material.py` starts with
+`#!/usr/bin/python3.12`. The shell wrappers that call it require that
+interpreter and stop if it is missing. The helper uses the Python
+standard library, not the agent virtualenv. `qm`, `flock`, `git`,
+`systemctl`, `node`, and `npm` are required only by the commands that
+name them.
 
 Stop at the first non-zero exit. Steps 1–9 deploy. Steps 10–13 roll
 back. A successful deploy stops after step 9. A later step is not a
@@ -135,8 +142,10 @@ Not read from a host. Commands stop when a check fails.
   `/var/lib/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`
   as root, else
   `$HOME/.local/state/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`.
-  Provisioner and guest-node witnesses are `/var/lib/hermes-control-deploy/`
-  and those commands run as root. New directories, not profile journals.
+  The Provisioner witness and the guest-node witness are host mutations
+  under `/var/lib/hermes-control-deploy/`, run as root. They are not
+  read-only diagnostics and they are not profile journals. The files
+  each command creates are listed under Host filesystem writes.
 
 ## Open questions
 
@@ -147,15 +156,23 @@ and 3.
 Exit 0 means `diagnostic=completed` and `host-ready=yes`. Exit 4 means
 `diagnostic=completed` and `host-ready=no`. Exit 4 is not a crash and
 it is not a pass: a missing or unknown prerequisite did not pass. Do
-not start step 1 unless the exit is 0.
+not start step 1 unless the exit is 0. Preflight prints `read-only=yes`
+and does not create files. A value printed as `redacted` is safe
+diagnostic output. It is not proof that the hidden configuration is
+correct, and it does not make the host ready.
 
 1. Hostnames, and are the three roles separate?
 2. Is `hermes-gateway-control.service` a system unit or a user unit?
 3. Is the stable directory the full `dcb3f950…` name, and is
    `fleet-delegation.conf` still the last loaded drop-in?
 4. Absolute MCP checkout paths, or `${HERMES_FLEET_CONTROL_ROOT}`?
-   Argument values that are not a public interpreter name, a safe flag,
-   an interpolated root, or a checkout path are `redacted`.
+   `host-ready=yes` requires `command` and `cwd` to be an absolute
+   checkout path or `${HERMES_FLEET_CONTROL_ROOT}`, and every argument
+   to be absent, one of `node`, `npm`, `python3`, or `python3.12`, a
+   non-credential flag, interpolation, or an absolute checkout path.
+   Anything else is printed as `redacted` and leaves exit 4. A redacted
+   `sk-` value, `nsec` value, bearer string, or the value after
+   `--token` or `--password` was hidden, not validated.
 5. Is `FLEET_CONTROL_PYTHON` unset, and is `FLEET_PROVISIONER_GIT_REF`
    unset on the stable Provisioner?
 6. Provisioner unit name, and which `onboarding/` and `tombstones/`
@@ -211,6 +228,53 @@ Step 1 writes the baseline only on the stable checkout with
 `config.mode`. Copies are mode `0600`. The directory is mode `0700`.
 A later command compares and does not replace them.
 
+## Host filesystem writes
+
+Preflight does not write. Every other command below names its writes.
+`baseline=matched` on a witness means the saved baseline was not
+replaced. It does not mean that run wrote nothing.
+
+- Step 1 creates the Control evidence directory (mode `0700`) and, once,
+  mode `0600` files `journals.manifest`, `fleet-delegation.conf`,
+  `config.yaml`, `config.mode`, `fleet.env`, `profile.env`,
+  `unit.fragment`, `mainpid`, `stable_dir`, and `scope`. The manifest
+  step opens an existing journal `*.lock` read-write, checks that it is
+  not held, and unlocks it. It does not write lock contents.
+- Step 2 creates
+  `/var/lib/hermes-control-deploy/c08cb1e-provisioner-witness` (mode
+  `0700`) and, once, `witness.manifest` and `identity` (mode `0600`).
+  Every run sets the directory mode again. A matched run does not
+  rewrite the two files.
+- Step 3 creates
+  `/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness` (mode
+  `0700`), creates or truncates `lock` and takes a non-blocking flock,
+  and replaces `qm-now.txt` with VMID and status rows. The first run
+  copies that file to `qm-baseline.txt` (mode `0600`). Later runs
+  compare and do not replace `qm-baseline.txt`. `lock` and `qm-now.txt`
+  follow the shell umask. This is a host mutation. It does not start,
+  stop, or destroy a guest.
+- Step 4 creates `/opt/hermes-fleet-control` if needed, `git init` of the
+  new checkout, and `git remote add` only when the origin has no
+  embedded credential. It fetches and checks out the deploy commit. It
+  may create `runtime/venv` through `install-control-runtime` and
+  `fleet-mcp/node_modules` through `npm ci`.
+- Step 5 may create `fleet-retirement.conf` (mode `0644`) beside the
+  loaded delegation drop-in, through an `O_EXCL` temp file, fsync, and
+  `os.replace`. It may replace `config.yaml` the same way, keeping the
+  original mode and owner. It writes evidence files
+  `fleet-retirement.conf.desired`, `config.yaml.deployed`, and
+  `config.status` (mode `0600`).
+- Step 6 runs `systemctl daemon-reload` and `systemctl restart` for this
+  unit when the live root is still stable. It does not write the
+  evidence files again.
+- Step 7 reads. It does not write.
+- Steps 8 and 9 run the step 2 and step 3 commands again. Step 9 still
+  truncates `lock` and replaces `qm-now.txt`.
+- Step 10 may replace `config.yaml` from the baseline, chmod it to the
+  recorded mode, write `fleet-retirement.conf.removed` (mode `0600`),
+  unlink `fleet-retirement.conf`, and restart the same unit.
+- Step 11 reads. Steps 12 and 13 repeat steps 2 and 3.
+
 ## 1. Control — baseline
 
 On the Control host:
@@ -229,8 +293,10 @@ not restart or create the new checkout.
 
 ## 2. Provisioner — witness
 
-On the Provisioner, as root. The first run writes the witness. Steps
-8 and 12 run this same command and only compare.
+On the Provisioner, as root. This is a host mutation, not a read-only
+diagnostic. The first run creates the witness directory and its two
+files. Later runs chmod the directory and compare. Steps 8 and 12 run
+this same command. See Host filesystem writes.
 
 ```bash
 docs/deploy/c08cb1e-provisioner-witness.sh
@@ -244,15 +310,24 @@ bodies.
 ## 3. Guest node — VM inventory
 
 On the guest node, as root. That host is the one where `qm` and
-`/etc/pve` are present. Does not start, stop, or destroy a guest.
-Steps 9 and 13 run this same command.
+`/etc/pve` are present. This command is a host mutation, not a
+read-only diagnostic. It does not start, stop, or destroy a guest.
+Every run creates or reuses
+`/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness` (mode
+`0700`), creates or truncates `lock` and holds a non-blocking flock,
+and replaces `qm-now.txt`. The first run copies that snapshot to
+`qm-baseline.txt` (mode `0600`). A later `baseline=matched` still
+replaces `qm-now.txt` and truncates `lock`; it does not replace
+`qm-baseline.txt`. The command prints `host-mutation=yes` and
+`read-only=no` before those writes. Steps 9 and 13 run this same
+command.
 
 ```bash
 docs/deploy/c08cb1e-guest-node-witness.sh
 ```
 
-Require `baseline=created` the first time and `baseline=matched` later,
-and `GUEST-NODE OK`.
+Require `host-mutation=yes`, `baseline=created` the first time and
+`baseline=matched` later, and `GUEST-NODE OK`.
 
 ## 4. Control — install the checkout beside the stable one
 
