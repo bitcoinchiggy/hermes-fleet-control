@@ -773,7 +773,8 @@ Hosts: UNRESOLVED until Gate B/D name them
 [ ] Gate E: verify prints STEP 7 OK. Witness reruns only if Gate D
     included them, and they print baseline=matched.
 [ ] Gate F is a separate approval before rollback.
-    rollback=incomplete: leave the unit stopped.
+    Success is rollback=done or rollback=already-stable.
+    While the command prints rollback=incomplete, the unit stays stopped.
 [ ] Do not paste config.yaml, drop-ins, env files, or /proc environ.
     Keep the preflight transcript as an internal operational record.
 [ ] Do not start, stop, or destroy a guest.
