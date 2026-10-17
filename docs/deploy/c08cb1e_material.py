@@ -62,6 +62,11 @@ HOST_RE = re.compile(r"^[A-Za-z0-9.-]+(?::[0-9]+)?$")
 FIXED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 AGENT_VENV = Path("/home/hermes/.hermes/hermes-agent/venv")
 RESTART_SETTLE_SECONDS = 10
+LOCK_WAIT_SECONDS = 5
+REQUIRED_ENV_KEYS = (
+    "FLEET_PROVISIONER_URL",
+    "FLEET_PROVISIONER_CALLER_TOKEN",
+)
 SHOW_PROPS = (
     "LoadState",
     "ActiveState",
@@ -129,7 +134,7 @@ def out(line: str) -> None:
 
 def origin_credential(url: str) -> str:
     """Return present, absent, or unknown. Never echo the URL."""
-    if "?" in url or "#" in url:
+    if "?" in url or "#" in url or ";" in url:
         return "unknown"
     if "://" in url:
         scheme, rest = url.split("://", 1)
@@ -197,15 +202,26 @@ def relative_script_fact(command: object, cwd: object, arg: object, root: str) -
 
     command must be the literal node and resolve on the pinned PATH to an
     executable regular file outside the checkout. cwd must be exactly
-    <root>/fleet-mcp. The argument is a single basename ending in .js, .mjs,
-    or .cjs. realpath(cwd/arg) must stay inside realpath(cwd) and must be a
-    regular file that is not a symlink.
+    <root>/fleet-mcp, must not be a symlink, and its real path must stay
+    inside the checkout. The argument is a single basename ending in .js,
+    .mjs, or .cjs. realpath(cwd/arg) must stay inside both realpath(cwd)
+    and the checkout, and must be a regular file that is not a symlink.
     """
     if command != "node" or not isinstance(cwd, str) or not isinstance(arg, str) or not root:
         return None
     if not RELATIVE_SCRIPT_RE.fullmatch(arg) or "/" in arg or ".." in arg:
         return None
     if cwd != str(Path(root) / "fleet-mcp"):
+        return None
+    cwd_path = Path(cwd)
+    if cwd_path.is_symlink():
+        return None
+    try:
+        root_real = Path(root).resolve(strict=True)
+        cwd_real = cwd_path.resolve(strict=True)
+    except OSError:
+        return None
+    if cwd_real == root_real or not _is_inside(cwd_real, root_real):
         return None
     node = resolve_fixed_tool("node")
     if node is None:
@@ -215,19 +231,20 @@ def relative_script_fact(command: object, cwd: object, arg: object, root: str) -
         node_real = node_path.resolve(strict=True)
     except OSError:
         return None
-    if not node_real.is_file() or node_real.is_symlink() or not os.access(node_real, os.X_OK):
+    if not node_real.is_file() or not os.access(node_real, os.X_OK):
         return None
-    if _is_inside(node_real, Path(root)):
+    if _is_inside(node_real, root_real):
         return None
-    script = Path(cwd) / arg
+    script = cwd_path / arg
     if script.is_symlink() or not script.is_file():
         return None
     try:
-        script_real = script.resolve()
-        cwd_real = Path(cwd).resolve()
+        script_real = script.resolve(strict=True)
     except OSError:
         return None
-    if not _is_inside(script_real, cwd_real) or not script_real.is_file():
+    if script_real.is_symlink() or not script_real.is_file():
+        return None
+    if not _is_inside(script_real, cwd_real) or not _is_inside(script_real, root_real):
         return None
     return "relative-script:" + arg
 
@@ -254,8 +271,11 @@ def classify_mcp_args(
                 if index + 1 < len(value):
                     nxt = value[index + 1]
                     if not (isinstance(nxt, str) and nxt.startswith("-") and "=" not in nxt):
-                        relative = relative_script_fact(command, cwd, nxt, root)
-                        parts.append(relative if relative is not None else classify_mcp_text(nxt))
+                        if allowed:
+                            relative = relative_script_fact(command, cwd, nxt, root)
+                            parts.append(relative if relative is not None else classify_mcp_text(nxt))
+                        else:
+                            parts.append("redacted")
                         index += 2
                         continue
             else:
@@ -658,6 +678,7 @@ def _self_check() -> None:
     _check(form == "scp-like" and token == "absent")
     _check(origin_credential("ssh://git@example.test/org/repo.git") == "absent")
     _check(origin_credential("https://example.test/r.git?access_token=query-secret") == "unknown")
+    _check(origin_credential("https://example.test/r.git;tok=semicolon-secret") == "unknown")
     _check(classify_mcp_text("${HERMES_FLEET_CONTROL_ROOT}/fleet-mcp") == "interpolated")
     _check(
         classify_mcp_text(
@@ -671,14 +692,29 @@ def _self_check() -> None:
     hidden = classify_mcp_args(["--token", "sk-test-value"])
     _check("sk-test-value" not in hidden and hidden == "redacted,redacted")
     _check(classify_mcp_args(["--version", "node"]) == "flag:--version,public:node")
+    hidden_public = classify_mcp_args(["--password", "python3"])
+    _check(hidden_public == "redacted,redacted" and "python3" not in hidden_public)
     _check(classify_mcp_text("-pHunter2secret") == "redacted")
     _check(CREDENTIAL_FLAG_RE.match("--access-token") is not None)
     _check(CREDENTIAL_FLAG_RE.match("--client_secret") is not None)
     _check(CREDENTIAL_FLAG_RE.match("--passwd") is not None)
     _check(CREDENTIAL_FLAG_RE.match("--bearer") is not None)
     _check(CREDENTIAL_FLAG_RE.match("--version") is None)
-    names, unparsed = env_key_report("OK_NAME=1\nMIIabc+/xyz,qqq=hidden\n")
-    _check(names == ["OK_NAME"] and unparsed == 1)
+    plain = "\n".join(env_key_report("OK_NAME=1\nMIIabc+/xyz,qqq=hidden\n"))
+    _check("fleet-env-name-count=1" in plain and "fleet-env-unparsed-lines=1" in plain)
+    _check("OK_NAME" not in plain and "MIIabc" not in plain)
+    pem = "\n".join(
+        env_key_report(
+            'SSL_KEY="-----BEGIN PRIVATE KEY-----\n'
+            "q83vEiZZtopSecretTail==\n"
+            '-----END PRIVATE KEY-----"\n'
+            "GOOD=1\n"
+        )
+    )
+    _check("fleet-env-name-count=2" in pem)
+    _check("q83vEiZZtopSecretTail" not in pem and "SSL_KEY" not in pem and "GOOD" not in pem)
+    quoted = "\n".join(env_key_report('A="line1\nSECRETWORD=abc"\nOK_NAME=1\n'))
+    _check("fleet-env-name-count=2" in quoted and "SECRETWORD" not in quoted)
     _check(mcp_args_configuration_ok("absent"))
     _check(mcp_args_configuration_ok("public:node,flag:--version,interpolated"))
     _check(not mcp_args_configuration_ok("public:node,redacted"))
@@ -954,56 +990,107 @@ def dropin_order_ok(names: list[str]) -> bool:
     return not any(name > "fleet-retirement.conf" for name in names)
 
 
+def _strictly_under(path: Path, root: Path) -> bool:
+    """True when path is a non-symlink file inside root after resolve."""
+    if path.is_symlink():
+        return False
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+        resolved.relative_to(root_resolved)
+    except (OSError, ValueError):
+        return False
+    return resolved != root_resolved
+
+
 def delegation_location(path: Path, user: bool) -> str:
-    text = str(path)
-    if user and "/.config/systemd/user/" in text:
-        return "user-config"
-    if not user and text.startswith("/etc/systemd/system/"):
-        return "system-config"
-    return "rejected"
+    if user:
+        root = Path.home() / ".config" / "systemd" / "user"
+        return "user-config" if _strictly_under(path, root) else "rejected"
+    root = Path("/etc/systemd/system")
+    return "system-config" if _strictly_under(path, root) else "rejected"
+
+
+def _quote_left_open(text: str, pending: str | None) -> str | None:
+    """Return the quote still open after text, or None when it closes."""
+    index = 0
+    quote = pending
+    if quote is None:
+        stripped = text.lstrip()
+        if not stripped or stripped[0] not in {'"', "'"}:
+            return None
+        quote = stripped[0]
+        index = text.find(quote) + 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == quote:
+            return None
+        index += 1
+    return quote
 
 
 def env_assigns_root_or_stable(text: str, stable: str) -> bool:
     """True when a validated name sets the checkout root or a value contains stable.
 
-    Unparsed lines are ignored here and are never returned.
+    Quoted continuations stay inside the value. This does not return file text.
     """
+    pending: str | None = None
     for line in text.splitlines():
+        if pending is not None:
+            if stable and stable in line:
+                return True
+            pending = _quote_left_open(line, pending)
+            continue
         if not line or line.lstrip().startswith("#") or "=" not in line:
             continue
         raw_name, value = line.split("=", 1)
         match = ENV_NAME_RE.fullmatch(raw_name)
-        if match is None:
-            continue
-        if match.group(1) == "HERMES_FLEET_CONTROL_ROOT":
+        if match is not None and match.group(1) == "HERMES_FLEET_CONTROL_ROOT":
             return True
-        if stable and stable in value:
+        if match is not None and stable and stable in value:
             return True
+        pending = _quote_left_open(value, None)
     return False
 
 
-def environment_file_paths(shown: dict[str, str]) -> list[str]:
-    found: list[str] = []
+def environment_file_entries(shown: dict[str, str]) -> list[tuple[str, bool]]:
+    """Paths from EnvironmentFiles. A leading - marks a systemd optional file."""
+    found: list[tuple[str, bool]] = []
     for token in shown.get("EnvironmentFiles", "").split():
-        if not token.startswith("/"):
+        if token.startswith("(") and token.endswith(")"):
             continue
-        found.append(token)
+        optional = token.startswith("-")
+        path = token[1:] if optional else token
+        if not path.startswith("/"):
+            continue
+        found.append((path, optional))
     return found
 
 
 def effective_unit_ok(shown: dict[str, str], stable: str) -> bool:
-    """False when ExecStart, WorkingDirectory, or an EnvironmentFile pins the checkout."""
+    """False when ExecStart, WorkingDirectory, or an EnvironmentFile pins the checkout.
+
+    A missing optional EnvironmentFile is tolerated. A missing required file,
+    a symlink, a path that contains the stable checkout, or a file that sets
+    the checkout root is not.
+    """
     for prop in ("ExecStart", "WorkingDirectory"):
         value = shown.get(prop, "")
         if stable and stable in value:
             return False
         if "HERMES_FLEET_CONTROL_ROOT=" in value:
             return False
-    for file_name in environment_file_paths(shown):
+    for file_name, optional in environment_file_entries(shown):
         if stable and stable in file_name:
             return False
         path = Path(file_name)
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink():
+            return False
+        if not path.is_file():
+            if optional:
+                continue
             return False
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -1571,17 +1658,60 @@ def require_side_files(evidence: Path) -> None:
         require_bytes(stored_path(evidence, label), (evidence / copy).read_bytes(), label, private=private)
 
 
-def _lock_directory(path: Path) -> int:
+def _lock_parent(create: bool) -> int:
+    """Exclusive flock on the evidence parent. Wait is bounded.
+
+    baseline may create the parent. Other commands stop when it is absent.
+    The same lock covers baseline, configure, restart, verify, rollback,
+    and confirm.
+    """
+    parent = evidence_root().parent
+    if parent.is_symlink():
+        die("evidence directory is not lockable")
+    created = False
+    if not parent.exists():
+        if not create:
+            die("baseline is missing")
+        parent.mkdir(parents=True, exist_ok=True)
+        created = True
+    if parent.is_symlink() or not parent.is_dir():
+        die("evidence directory is not lockable")
+    if created:
+        os.chmod(parent, 0o700)
     try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
         die("evidence directory is not lockable")
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            pass
+        except OSError:
+            os.close(fd)
+            die("evidence directory is not lockable")
+        if time.monotonic() >= deadline:
+            os.close(fd)
+            die("another deploy command holds the evidence lock")
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _run_locked(body, *, create: bool = False) -> int:
+    lock = _lock_parent(create)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-    except OSError:
+        return body()
+    finally:
+        os.close(lock)
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
         os.close(fd)
-        die("evidence directory is not lockable")
-    return fd
 
 
 def rehash_recorded(recorded: str) -> str:
@@ -1615,9 +1745,9 @@ def journal_difference(env: dict[str, str] | None, recorded: str) -> str:
     return "none" if current == recorded else "changed"
 
 
-def warn_journals(kind: str) -> None:
+def warn_journals(kind: str, *, action: str = "rollback") -> None:
     if kind != "none":
-        warn("journal manifest changed; rollback will not modify journals")
+        warn("journal manifest changed; " + action + " will not modify journals")
     out("journal-warning=" + kind)
 
 
@@ -1792,45 +1922,125 @@ def _private_write(path: Path, data: bytes) -> None:
     os.close(fd)
 
 
-def _save_baseline(evidence: Path, files: dict[str, bytes]) -> str:
+def _baseline_names_present(evidence: Path, names: set[str]) -> bool:
     manifest = evidence / "journals.manifest"
-    if manifest.exists():
-        for name, data in files.items():
-            current = evidence / name
-            if not current.is_file() or current.read_bytes() != data:
-                die("baseline changed")
-        return "matched"
-    if evidence.exists() and any(path.is_file() for path in evidence.iterdir()):
-        die("partial baseline")
-    evidence.mkdir(parents=True, exist_ok=True)
-    os.chmod(evidence, 0o700)
-    for name, data in files.items():
-        _private_write(evidence / name, data)
+    try:
+        if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    for name in names:
+        path = evidence / name
+        if path.is_symlink() or not path.is_file():
+            return False
+    return True
+
+
+def _unexpected_child(directory: Path, names: set[str]) -> bool:
+    for child in directory.iterdir():
+        if child.name not in names:
+            return True
+    return False
+
+
+def _save_baseline(evidence: Path, files: dict[str, bytes]) -> str:
+    """Stage every evidence file, then rename the directory into place.
+
+    A directory is complete only when it is not a symlink and every required
+    file, including a non-empty journals.manifest, is a regular file. A
+    partial directory of known names is discarded and rewritten. An unexpected
+    name is left in place and stops the command. Journals live outside this
+    directory and are not deleted.
+    """
+    if "journals.manifest" not in files or not files["journals.manifest"]:
+        die("baseline is missing journals.manifest")
+    if evidence.is_symlink():
+        die("baseline is not a directory")
+    names = set(files)
+    if evidence.exists():
+        if not evidence.is_dir():
+            die("baseline is not a directory")
+        if _unexpected_child(evidence, names):
+            die("unexpected baseline file")
+        if _baseline_names_present(evidence, names):
+            for name, data in files.items():
+                if (evidence / name).read_bytes() != data:
+                    die("baseline changed")
+            return "matched"
+        shutil.rmtree(evidence)
+    parent = evidence.parent
+    if parent.is_symlink() or not parent.is_dir():
+        die("evidence directory is not lockable")
+    staging = parent / (evidence.name + ".staging")
+    if staging.exists():
+        if staging.is_symlink() or not staging.is_dir() or _unexpected_child(staging, names):
+            die("baseline staging is unusable")
+        shutil.rmtree(staging)
+    try:
+        staging.mkdir(mode=0o700)
+        os.chmod(staging, 0o700)
+        ordered = [name for name in files if name != "journals.manifest"]
+        ordered.append("journals.manifest")
+        for name in ordered:
+            _private_write(staging / name, files[name])
+        _fsync_dir(staging)
+        os.rename(staging, evidence)
+        os.chmod(evidence, 0o700)
+        _fsync_dir(parent)
+    except Exception:
+        if staging.is_dir() and not staging.is_symlink():
+            shutil.rmtree(staging)
+        raise
     return "created"
 
 
-def env_key_report(text: str) -> tuple[list[str], int]:
-    """Validated env names, plus a count of every other non-comment line.
+def env_key_report(text: str) -> list[str]:
+    """Safe fleet-env lines. Names and values from the file are not included.
 
-    The returned names are the identifier only. Unparsed text is not returned.
+    The count and sha256 cover validated assignment names only. A quoted
+    value that does not close on its line makes every following line
+    unparsed until the closing quote. Required keys are reported as
+    present or absent.
     """
     names: list[str] = []
     unparsed = 0
+    pending: str | None = None
     for line in text.splitlines():
+        if pending is not None:
+            unparsed += 1
+            pending = _quote_left_open(line, pending)
+            continue
         if not line or line.lstrip().startswith("#"):
             continue
         if "=" not in line:
             unparsed += 1
             continue
-        match = ENV_NAME_RE.fullmatch(line.split("=", 1)[0])
+        raw_name, value = line.split("=", 1)
+        match = ENV_NAME_RE.fullmatch(raw_name)
         if match is None:
             unparsed += 1
-            continue
-        names.append(match.group(1))
-    return names, unparsed
+        else:
+            names.append(match.group(1))
+        pending = _quote_left_open(value, None)
+    payload = "".join(name + "\n" for name in sorted(set(names)))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    found = set(names)
+    lines = [
+        "fleet-env-name-count=" + str(len(names)),
+        "fleet-env-names-sha256=" + digest,
+        "fleet-env-unparsed-lines=" + str(unparsed),
+    ]
+    for key in REQUIRED_ENV_KEYS:
+        lines.append(key + "=" + ("present" if key in found else "absent"))
+    return lines
 
 
 def cmd_baseline() -> int:
+    """Write the evidence baseline once. Does not restart or create the checkout."""
+    return _run_locked(_cmd_baseline_locked, create=True)
+
+
+def _cmd_baseline_locked() -> int:
     """Write the evidence baseline once. Does not restart or create the checkout.
 
     Valid only before fleet-retirement.conf exists. A later re-run stops
@@ -1889,7 +2099,7 @@ def cmd_baseline() -> int:
     ):
         if SAFE_PATH_RE.fullmatch(str(path)) is None:
             die(label + " is not a usable path")
-    key_names, unparsed = env_key_report(fleet_env.read_text(encoding="utf-8", errors="replace"))
+    env_lines = env_key_report(fleet_env.read_text(encoding="utf-8", errors="replace"))
     files = {
         "journals.manifest": manifest.encode(),
         "fleet-delegation.conf": delegation.read_bytes(),
@@ -1915,8 +2125,8 @@ def cmd_baseline() -> int:
     out("NRestarts=" + shown["NRestarts"])
     out("nrestarts-measures=" + NRESTARTS_MEASURES)
     out("dropins=" + ",".join(names))
-    out("fleet-env-keys=" + ",".join(key_names))
-    out("fleet-env-unparsed-lines=" + str(unparsed))
+    for line in env_lines:
+        out(line)
     out("FLEET_CONTROL_PYTHON=absent")
     out("journal-manifest=sha256:" + hashlib.sha256(manifest.encode()).hexdigest())
     out("stable=" + str(stable))
@@ -1997,14 +2207,14 @@ def _configure_locked(evidence: Path) -> int:
 
 def cmd_configure() -> int:
     """Write the rollback record, then edit the drop-in and config.yaml."""
+    return _run_locked(_cmd_configure_locked)
+
+
+def _cmd_configure_locked() -> int:
     evidence = evidence_root()
     if not (evidence / "journals.manifest").is_file():
         die("baseline is missing")
-    lock = _lock_directory(evidence)
-    try:
-        return _configure_locked(evidence)
-    finally:
-        os.close(lock)
+    return _configure_locked(evidence)
 
 
 def _restart(
@@ -2049,6 +2259,10 @@ def _restart(
 
 
 def cmd_restart() -> int:
+    return _run_locked(_cmd_restart_locked)
+
+
+def _cmd_restart_locked() -> int:
     evidence = evidence_root()
     _recorded, user = _same_scope(evidence)
     shown, env, pid = _live_gateway(user)
@@ -2075,6 +2289,10 @@ def cmd_restart() -> int:
 
 
 def cmd_verify() -> int:
+    return _run_locked(_cmd_verify_locked)
+
+
+def _cmd_verify_locked() -> int:
     evidence = evidence_root()
     _recorded, user = _same_scope(evidence)
     shown, env, _pid = _live_gateway(user)
@@ -2106,33 +2324,147 @@ def cmd_verify() -> int:
     return 0
 
 
-def _rollback_config(evidence: Path, config: Path) -> bytes:
+def _side_labels(evidence: Path) -> list[str]:
+    """Labels whose live bytes differ. Does not write those files."""
+    labels: list[str] = []
+    for label, copy, private in (
+        ("profile.env.path", "profile.env", True),
+        ("fleet.env.path", "fleet.env", False),
+        ("unit.fragment.path", "unit.fragment", False),
+    ):
+        path = stored_path(evidence, label)
+        expected = (evidence / copy).read_bytes()
+        drifted = path.is_symlink() or not path.is_file() or path.read_bytes() != expected
+        if not drifted and private and stat.S_IMODE(path.stat().st_mode) & 0o077:
+            drifted = True
+        if drifted:
+            labels.append(label)
+    return labels
+
+
+def warn_side_files(labels: list[str], *, action: str) -> None:
+    if labels:
+        warn("side file differs from baseline; " + action + " will not modify it")
+    out("side-file-drift=" + (",".join(labels) if labels else "none"))
+
+
+def _delegation_changed(evidence: Path, delegation: Path) -> bool:
+    recorded = evidence / "fleet-delegation.conf"
+    if delegation.is_symlink() or not delegation.is_file() or recorded.is_symlink() or not recorded.is_file():
+        return True
+    return delegation.read_bytes() != recorded.read_bytes()
+
+
+def _fleet_server_naming(text: str, needle: str) -> str | None:
+    """The single mcp server whose command, cwd, or args contain needle."""
+    data = _load_yaml(text)
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return None
+    hits: list[str] = []
+    for name, server in servers.items():
+        if not isinstance(name, str) or not isinstance(server, dict):
+            continue
+        fields: list[str] = []
+        command = server.get("command")
+        cwd = server.get("cwd")
+        if isinstance(command, str):
+            fields.append(command)
+        if isinstance(cwd, str):
+            fields.append(cwd)
+        args = server.get("args")
+        if isinstance(args, list):
+            fields.extend(item for item in args if isinstance(item, str))
+        if any(needle in item for item in fields):
+            hits.append(name)
+    if len(hits) != 1:
+        return None
+    return hits[0]
+
+
+def _reverse_fleet_paths(live: bytes, stable_dir: str) -> bytes | None:
+    """Swap the new checkout back to stable inside one fleet MCP entry.
+
+    Returns None when that swap is not safe. Does not print file text.
+    """
+    try:
+        text = live.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    new = str(NEW)
+    if new not in text:
+        return None
+    sink = sys.stderr
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    try:
+        try:
+            server = _fleet_server_naming(text, new)
+            if server is None:
+                return None
+            updated, _status = rewrite_config(text, new, stable_dir, server)
+        except Exception:
+            return None
+    finally:
+        sys.stderr.close()
+        sys.stderr = sink
+    if new in updated:
+        return None
+    return updated.encode("utf-8")
+
+
+def _rollback_config(evidence: Path, config: Path, stable_dir: str) -> str:
+    """restored, unchanged, reversed, or incomplete. Does not print config text."""
     baseline = (evidence / "config.yaml").read_bytes()
     deployed_file = evidence / "config.yaml.deployed"
     deployed = deployed_file.read_bytes() if deployed_file.is_file() and not deployed_file.is_symlink() else None
     if config.is_symlink() or not config.is_file():
-        die("config.yaml is missing")
+        out("config-rollback=incomplete")
+        return "incomplete"
     live = config.read_bytes()
+    if live == baseline:
+        out("config-rollback=unchanged")
+        return "unchanged"
     if deployed is not None and live == deployed:
         atomic_replace(config, baseline)
         os.chmod(config, int((evidence / "config.mode").read_text(encoding="utf-8").strip()))
-    elif live != baseline:
-        die("config.yaml is neither the baseline nor the deployed bytes")
-    return baseline
+        out("config-rollback=restored")
+        return "restored"
+    reversed_bytes = _reverse_fleet_paths(live, stable_dir)
+    if reversed_bytes is None:
+        out("config-rollback=incomplete")
+        return "incomplete"
+    atomic_replace(config, reversed_bytes)
+    out("config-rollback=reversed")
+    return "reversed"
 
 
-def _rollback_dropin(evidence: Path, delegation: Path) -> Path:
+def _rollback_dropin(evidence: Path, delegation: Path) -> str:
+    """removed, absent, or unverified. Unverified bytes are left on disk."""
     dropin = delegation.with_name("fleet-retirement.conf")
     if dropin.is_symlink():
-        die("fleet-retirement.conf is a symlink")
+        out("dropin-rollback=unverified")
+        return "unverified"
+    if not dropin.exists():
+        out("dropin-rollback=absent")
+        return "absent"
     desired_file = evidence / "fleet-retirement.conf.desired"
-    desired = desired_file.read_bytes() if desired_file.is_file() and not desired_file.is_symlink() else None
-    if dropin.exists():
-        if desired is None or dropin.read_bytes() != desired:
-            die("fleet-retirement.conf bytes differ")
-        _private_write(evidence / "fleet-retirement.conf.removed", dropin.read_bytes())
-        dropin.unlink()
-    return dropin
+    if not desired_file.is_file() or desired_file.is_symlink() or dropin.read_bytes() != desired_file.read_bytes():
+        out("dropin-rollback=unverified")
+        return "unverified"
+    _private_write(evidence / "fleet-retirement.conf.removed", dropin.read_bytes())
+    dropin.unlink()
+    out("dropin-rollback=removed")
+    return "removed"
+
+
+def _config_names_new(config: Path) -> bool:
+    if config.is_symlink() or not config.is_file():
+        return True
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    return str(NEW) in text
 
 
 def _confirm_dropin_unloaded(user: bool) -> dict[str, str]:
@@ -2147,13 +2479,24 @@ def _confirm_dropin_unloaded(user: bool) -> dict[str, str]:
     return shown
 
 
+def _rollback_incomplete() -> None:
+    out("rollback=incomplete")
+    die("rollback incomplete; operator intervention required")
+
+
 def cmd_rollback() -> int:
+    """Undo the drop-in and config.yaml. Journals are only read."""
+    return _run_locked(_cmd_rollback_locked)
+
+
+def _cmd_rollback_locked() -> int:
     """Undo the drop-in and config.yaml. Journals are only read.
 
     Scope and the stable directory come from the evidence directory.
     An inactive or failed unit is accepted. MainPID 0 is the before
-    value. A journal manifest difference is a warning. This command
-    does not write or delete journal files.
+    value. Journal, side-file, and delegation differences are warnings.
+    This command does not write or delete journal files, and it does
+    not overwrite a drifted side file or delegation file.
     """
     evidence = evidence_root()
     _recorded, user = recorded_scope(evidence)
@@ -2171,51 +2514,71 @@ def cmd_rollback() -> int:
         die("gateway environ is unreadable")
     recorded = manifest_file.read_text(encoding="utf-8")
     warn_journals(journal_difference(env, recorded))
-    require_side_files(evidence)
+    warn_side_files(_side_labels(evidence), action="rollback")
     delegation = stored_path(evidence, "delegation.path")
-    if delegation.is_symlink() or not delegation.is_file():
-        die("fleet-delegation.conf is missing")
-    if delegation.read_bytes() != (evidence / "fleet-delegation.conf").read_bytes():
-        die("fleet-delegation.conf changed")
+    if _delegation_changed(evidence, delegation):
+        warn("delegation file differs from baseline; rollback will not modify it")
+        out("delegation-drift=changed")
+    else:
+        out("delegation-drift=none")
+    dropin_status = _rollback_dropin(evidence, delegation)
     config = stored_path(evidence, "config.path")
-    baseline = _rollback_config(evidence, config)
-    dropin = _rollback_dropin(evidence, delegation)
-    _confirm_dropin_unloaded(user)
+    config_status = _rollback_config(evidence, config, stable)
+    dropin = delegation.with_name("fleet-retirement.conf")
+    if dropin_status in {"removed", "absent"}:
+        _confirm_dropin_unloaded(user)
+    incompatible = _config_names_new(config)
+    if dropin_status == "unverified" or config_status == "incomplete" or incompatible:
+        _rollback_incomplete()
     active = shown.get("ActiveState") == "active" and shown.get("SubState") == "running"
     root = "" if env is None else env.get("HERMES_FLEET_CONTROL_ROOT", "")
-    config_ok = config.read_bytes() == baseline
     dropin_gone = not dropin.exists() and not dropin.is_symlink()
-    if active and root == stable and config_ok and dropin_gone:
+    if active and root == stable and config_status == "unchanged" and dropin_status == "absent" and dropin_gone:
         out("rollback=already-stable")
         out("STEP 10 OK")
         return 0
     _restart(user, before, stable, False, check_journals=False)
+    if _config_names_new(config):
+        _rollback_incomplete()
     out("rollback=done")
     out("STEP 10 OK")
     return 0
 
 
 def cmd_confirm() -> int:
+    return _run_locked(_cmd_confirm_locked)
+
+
+def _cmd_confirm_locked() -> int:
     evidence = evidence_root()
     _recorded, user = _same_scope(evidence)
     shown, env, pid = _live_gateway(user)
     if shown.get("NeedDaemonReload") != "no":
         die("daemon reload is pending")
+    if str(env.get("FLEET_CONTROL_PYTHON", "")).strip():
+        die("FLEET_CONTROL_PYTHON is set")
     stable = (evidence / "stable_dir").read_text(encoding="utf-8").strip()
     if env.get("HERMES_FLEET_CONTROL_ROOT") != stable:
         die("running root is not the stable checkout")
     require_pins(Path(stable), STABLE_SHA, STABLE_TREE)
+    if "fleet-delegation.conf" not in dropin_names(shown):
+        die("fleet-delegation.conf is not loaded")
     if any(Path(part).name == "fleet-retirement.conf" for part in shown.get("DropInPaths", "").split()):
         die("retirement drop-in is still loaded")
     delegation = stored_path(evidence, "delegation.path")
     retirement = delegation.with_name("fleet-retirement.conf")
     if retirement.exists() or retirement.is_symlink():
         die("retirement drop-in is still on disk")
-    _require_manifest(env)
-    require_side_files(evidence)
+    manifest_file = evidence / "journals.manifest"
+    if manifest_file.is_symlink() or not manifest_file.is_file():
+        die("baseline is missing")
+    warn_journals(journal_difference(env, manifest_file.read_text(encoding="utf-8")), action="confirm")
+    warn_side_files(_side_labels(evidence), action="confirm")
     config = stored_path(evidence, "config.path")
-    if config.read_bytes() != (evidence / "config.yaml").read_bytes():
-        die("config.yaml is not the baseline")
+    if config.is_symlink() or not config.is_file():
+        die("config.yaml is missing")
+    if _config_names_new(config):
+        die("config.yaml names the new checkout")
     if _cwd_under(pid, NEW):
         die("a gateway process cwd is the new checkout")
     out("STEP 11 OK")

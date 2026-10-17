@@ -6,6 +6,7 @@
 # - creates /var/lib/hermes-control-deploy/c08cb1e-guest-node-witness
 #   if missing, then sets that directory to mode 0700
 # - creates or truncates lock in that directory and takes a non-blocking flock
+#   (if the lock is already held, the command prints STOP and exits 1)
 # - replaces qm-now.txt with VMID and status rows from `qm list`
 # The first run copies qm-now.txt to qm-baseline.txt and sets mode 0600.
 # Later runs compare the two files and do not replace the baseline.
@@ -54,7 +55,10 @@ if [[ -L "$EVIDENCE/lock" || -L "$EVIDENCE/qm-now.txt" || -L "$EVIDENCE/qm-basel
   exit 1
 fi
 exec 9>"$EVIDENCE/lock"
-flock -n 9
+if ! flock -n 9; then
+  echo "STOP: evidence lock is held" >&2
+  exit 1
+fi
 qm list | awk 'NR > 1 && $1 ~ /^[0-9]+$/ {
   status = ""
   for (i = 1; i <= NF; i++) if ($i ~ /^(running|stopped|paused)$/) status = $i
