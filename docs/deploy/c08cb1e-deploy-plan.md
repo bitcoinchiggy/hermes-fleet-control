@@ -14,16 +14,25 @@ contains that copied `docs/deploy/` folder, so the paths below resolve.
 The scripts are mode `0755`. `c08cb1e_material.py` starts with
 `#!/usr/bin/python3.12`. The shell wrappers that call it require that
 interpreter and stop if it is missing. The helper uses the Python
-standard library, not the agent virtualenv. `qm`, `flock`, `git`,
-`systemctl`, `node`, and `npm` are required only by the commands that
-name them.
+standard library plus PyYAML when PyYAML is already installed. It does
+not install PyYAML and it does not use the agent virtualenv.
+`configure` and the preflight YAML read import PyYAML in-process.
+Preflight does not spawn the stable checkout's virtualenv and does not
+import Provisioner code. `qm`, `flock`, `git`, `systemctl`, `node`, and
+`npm` are required only by the commands that name them. `node` and
+`npm` are resolved on `PATH=/usr/sbin:/usr/bin:/sbin:/bin` only. A
+`node` that exists only on another PATH is reported as absent.
 
 Stop at the first non-zero exit. Steps 1–9 deploy. Steps 10–13 roll
 back. A successful deploy stops after step 9. A later step is not a
-repair. Re-running records a baseline once, refuses to replace it, and
-skips a restart that already reached the revision it checks. It does
-not delete journals, reservations, tombstones, profile files, or the
-stable checkout.
+repair. Re-running records a baseline once and refuses to replace it.
+Step 1 also stops when `fleet-retirement.conf` is loaded or on disk, so
+it is valid only before step 5. A restart that already reached the
+revision it checks is skipped. Rollback does not delete journals,
+reservations, tombstones, profile files, or the stable checkout. It
+does not overwrite a profile `.env`, the fleet env file, the unit
+fragment, or `fleet-delegation.conf` when those bytes differ from the
+baseline; that difference stops rollback before the config restore.
 
 ## Pins
 
@@ -136,8 +145,10 @@ Not read from a host. Commands stop when a check fails.
   unit whose name contains `provisioner`, or is `hermes-fleet.service`
   or `fleet-provisioner.service`, and `tombstones/` has at least one
   json file.
-- Node is 20 or newer. A second paste skips `npm ci` and
-  `install-control-runtime` when the import and `npm ls` already match.
+- Node on the pinned PATH is 20 or newer. A second paste skips `npm ci`
+  and `install-control-runtime` when the import and `npm ls` already
+  match. `/usr/bin/python3.12` resolves outside the agent virtualenv.
+  Baseline and install both stop when it does not.
 - Control evidence:
   `/var/lib/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`
   as root, else
@@ -167,26 +178,40 @@ correct, and it does not make the host ready.
    `fleet-delegation.conf` still the last loaded drop-in?
 4. Absolute MCP checkout paths, or `${HERMES_FLEET_CONTROL_ROOT}`?
    `host-ready=yes` requires `command` and `cwd` to be an absolute
-   checkout path or `${HERMES_FLEET_CONTROL_ROOT}`, and every argument
-   to be absent, one of `node`, `npm`, `python3`, or `python3.12`, a
-   non-credential flag, interpolation, or an absolute checkout path.
-   Anything else is printed as `redacted` and leaves exit 4. A redacted
-   `sk-` value, `nsec` value, bearer string, or the value after
-   `--token` or `--password` was hidden, not validated.
+   checkout path or `${HERMES_FLEET_CONTROL_ROOT}`. An argument is
+   ready only when it is absent, interpolated, an absolute checkout
+   path, one of `node`, `npm`, `python3`, or `python3.12`, the flag
+   `--version` or `--stdio`, or a `relative-script:<basename>` fact.
+   The relative-script fact is printed only for a basename matching
+   `^[A-Za-z0-9._-]+\.(js|mjs|cjs)$` with no `/` and no `..`, when
+   `command` is `node` on the pinned PATH and that binary's real path
+   is an executable regular file outside the checkout, `cwd` is exactly
+   `<root>/fleet-mcp`, and `realpath(cwd/arg)` is a regular non-symlink
+   file inside `realpath(cwd)`. The node binary may be a symlink to
+   that outside file. The script file may not be a symlink. Any other
+   flag, including `-p...` and `--access-token`, is printed as
+   `redacted`. A value after a flag is classified as a value. `redacted`
+   is not configuration validation and leaves exit 4.
 5. Is `FLEET_CONTROL_PYTHON` unset, and is `FLEET_PROVISIONER_GIT_REF`
    unset on the stable Provisioner?
-6. Provisioner unit name, and which `onboarding/` and `tombstones/`
-   directories does the deployed state loader resolve?
+6. Provisioner unit name? Preflight does not import the deployed
+   state loader. When a provisioner unit is on this host it prints
+   `onboarding-dir=deferred-to-witness` and
+   `tombstones-dir=deferred-to-witness`. Step 2 resolves the directories.
 7. Does the gateway load `skills/fleet-delegation/SKILL.md` from this
    checkout or from a profile copy? This procedure does not copy the
    skill. Tool text travels with `index.js`. `skill-load=home-skills`
    means a copy under `HERMES_HOME/skills` exists; the fleet-tip loader
-   prefers that over `skills.external_dirs`. That is not a process-map
-   observation.
+   prefers that over `skills.external_dirs`.
+   `skill-load=checkout-only-not-on-skill-path` is an accepted readiness
+   value when that profile copy is absent and the checkout file exists.
+   Neither value is a process-map observation, and this procedure does
+   not claim the running loader read the file.
 8. Is the origin URL free of an embedded token? Step 4 stops when URL
-   userinfo is present. It does not copy that URL into the new git
-   config and it does not print it. Scp-style `git@host:path` is not
-   userinfo.
+   userinfo contains a password, or when the URL contains `?` or `#`.
+   Those forms are not copied and are not printed. `ssh://git@host/...`
+   with a username and no password is treated as credential-free, as is
+   scp-style `git@host:path`. Other URL userinfo is not copied.
 
 ## Control stops
 
@@ -196,37 +221,63 @@ names and paths may be printed. Do not print values whose keys match
 `KEY`.
 
 - Python 3.12 is missing or resolves inside the agent virtualenv.
-- Both unit scopes are loaded, or neither is.
+  Baseline and install check this.
+- Both unit scopes are loaded, or neither is, on steps that select a
+  scope from systemd. Rollback reads the scope saved at step 1 instead,
+  so a failed unit does not have to be active for that selection.
 - Gateway not active and running, or `MainPID` is not a new live pid
-  after a restart that was supposed to change it.
+  after a restart that was supposed to change it. Rollback accepts an
+  inactive or failed unit and uses `MainPID` 0 as the before value.
 - `FLEET_CONTROL_PYTHON` is set. On step 1,
   `HERMES_FLEET_CONTROL_INTEGRATION` is not `1`. After step 6 the root
   is not the new checkout.
-- Stable directory is not exactly one `dcb3f950*` checkout at the pins.
-  Running root is neither that directory nor the new one.
-- `fleet-delegation.conf` is not exactly one loaded regular file, or a
-  loaded drop-in name sorts after `fleet-retirement.conf`.
+- Stable directory is not exactly one `dcb3f950*` checkout at the HEAD
+  and tree pins. Baseline and install both check those pins. Running
+  root is neither that directory nor the new one.
+- `fleet-delegation.conf` is not a regular file under
+  `/etc/systemd/system/` or `~/.config/systemd/user/`, or a loaded
+  drop-in name sorts after `fleet-retirement.conf` (for example
+  `override.conf`).
+- `ExecStart`, `WorkingDirectory`, or an `EnvironmentFile=` path
+  references the stable checkout or sets `HERMES_FLEET_CONTROL_ROOT`.
+  Baseline, configure, restart, verify, and confirm stop. Rollback does
+  not use that stop: the stable path is the rollback target.
+- `NeedDaemonReload` is not `no` before an edit or after a reload.
 - A journal dir is missing, not private (`mode & 077`), empty, or holds
-  a taken `*.lock`. After step 1, the sha256 manifest must match
-  `journals.manifest`.
-- The stable git origin has URL userinfo, or its form is unknown.
+  a taken `*.lock`. After step 1, steps other than rollback stop when
+  the sha256 manifest does not match `journals.manifest`. Rollback
+  prints `WARNING: journal manifest changed; rollback will not modify
+  journals` and `journal-warning=changed` or `journal-warning=unreadable`.
+  It does not overwrite or delete journal files.
+- The stable git origin has URL userinfo other than an `ssh://`
+  username with no password, contains `?` or `#`, or its form is unknown.
 - Fleet env file is not a regular file. Profile `.env` is missing or
-  not private.
-- `config.yaml`, `fleet-delegation.conf`, profile `.env`, fleet env, or
-  the unit fragment differs from the step 1 baseline, except the step 5
-  rewrite recorded as `config.yaml.deployed`.
-- Worker projection differs from the baseline. The projection keeps
-  name, declared, retained, tombstone name and vmid, observed state,
-  public key hex, vmid, and onboarding id and status.
-- `git status --porcelain=v1 -uall` on the new checkout shows anything
-  outside untracked `runtime/` and `fleet-mcp/node_modules/`.
+  not private. After step 1, profile `.env`, the fleet env, and the
+  unit fragment must still match the baseline copies.
+- `config.yaml` or `fleet-delegation.conf` differs from the step 1
+  baseline, except the step 5 rewrite recorded as `config.yaml.deployed`.
+- `git status --porcelain=v1 -uall` on the new checkout, checked by
+  install and verify, shows anything outside untracked `runtime/` and
+  `fleet-mcp/node_modules/`.
+
+`project_workers` and `require_tools` are defined in the helper. No
+command calls them. This procedure does not fetch worker status and
+does not spawn the Fleet MCP server.
 
 Step 1 writes the baseline only on the stable checkout with
-`fleet-retirement.conf` absent. Files: `journals.manifest`, copies of
-`fleet-delegation.conf`, `config.yaml`, the fleet env, the profile
-`.env`, and the unit fragment, plus `mainpid`, `stable_dir`, and
-`config.mode`. Copies are mode `0600`. The directory is mode `0700`.
-A later command compares and does not replace them.
+`fleet-retirement.conf` absent, including on a later re-run. Files:
+`journals.manifest`, copies of `fleet-delegation.conf`, `config.yaml`,
+the fleet env, the profile `.env`, and the unit fragment, plus
+`mainpid`, `stable_dir`, `scope`, `config.mode`, `config.path`,
+`profile.env.path`, `fleet.env.path`, `unit.fragment.path`, and
+`delegation.path`. Copies are mode `0600`. The directory is mode
+`0700`. A later command compares and does not replace them. An evidence
+directory written by an older helper, without those path files, stops
+the later commands. Move that directory aside before taking a new
+baseline. Do not delete journals to do that. Fleet env key names are
+printed only when the text before `=` matches
+`^(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*$`. Every other non-comment
+line increments `fleet-env-unparsed-lines` and is not printed.
 
 ## Host filesystem writes
 
@@ -237,9 +288,12 @@ replaced. It does not mean that run wrote nothing.
 - Step 1 creates the Control evidence directory (mode `0700`) and, once,
   mode `0600` files `journals.manifest`, `fleet-delegation.conf`,
   `config.yaml`, `config.mode`, `fleet.env`, `profile.env`,
-  `unit.fragment`, `mainpid`, `stable_dir`, and `scope`. The manifest
-  step opens an existing journal `*.lock` read-write, checks that it is
-  not held, and unlocks it. It does not write lock contents.
+  `unit.fragment`, `mainpid`, `stable_dir`, `scope`, `config.path`,
+  `profile.env.path`, `fleet.env.path`, `unit.fragment.path`, and
+  `delegation.path`. The manifest step opens an existing journal
+  `*.lock` with `O_RDONLY|O_NOFOLLOW`, probes `LOCK_SH|LOCK_NB`, and
+  unlocks it. A symlink stops. It does not take an exclusive lock and
+  it does not write lock contents.
 - Step 2 creates
   `/var/lib/hermes-control-deploy/c08cb1e-provisioner-witness` (mode
   `0700`) and, once, `witness.manifest` and `identity` (mode `0600`).
@@ -251,28 +305,39 @@ replaced. It does not mean that run wrote nothing.
   and replaces `qm-now.txt` with VMID and status rows. The first run
   copies that file to `qm-baseline.txt` (mode `0600`). Later runs
   compare and do not replace `qm-baseline.txt`. `lock` and `qm-now.txt`
-  follow the shell umask. This is a host mutation. It does not start,
+  follow the shell umask. A symlink at the evidence directory, a parent,
+  or `lock`, `qm-now.txt`, or `qm-baseline.txt` stops the command before
+  `mkdir` or a redirect. This is a host mutation. It does not start,
   stop, or destroy a guest.
 - Step 4 creates `/opt/hermes-fleet-control` if needed, `git init` of the
   new checkout, and `git remote add` only when the origin has no
   embedded credential. It fetches and checks out the deploy commit. It
   may create `runtime/venv` through `install-control-runtime` and
   `fleet-mcp/node_modules` through `npm ci`.
-- Step 5 may create `fleet-retirement.conf` (mode `0644`) beside the
-  loaded delegation drop-in, through an `O_EXCL` temp file, fsync, and
-  `os.replace`. It may replace `config.yaml` the same way, keeping the
-  original mode and owner. It writes evidence files
+- Step 5 holds an exclusive flock on the evidence directory for the
+  whole command. It first writes evidence files
   `fleet-retirement.conf.desired`, `config.yaml.deployed`, and
-  `config.status` (mode `0600`).
+  `config.status` (mode `0600`). It then may create
+  `fleet-retirement.conf` (mode `0644`) beside the loaded delegation
+  drop-in, through an `O_EXCL` temp file, a full write, fsync, chown,
+  chmod, `os.replace`, and an fsync of the directory. It may replace
+  `config.yaml` the same way, keeping the original mode and owner. A
+  crash after the evidence write and before the live edit leaves the
+  rollback record in place and does not require the live files to have
+  changed.
 - Step 6 runs `systemctl daemon-reload` and `systemctl restart` for this
-  unit when the live root is still stable. It does not write the
-  evidence files again.
+  unit when the live root is still stable. It then waits about 10
+  seconds and requires the same `MainPID`, `active`/`running`, and an
+  unchanged `NRestarts` since that first post-restart read. It does not
+  write the evidence files again.
 - Step 7 reads. It does not write.
 - Steps 8 and 9 run the step 2 and step 3 commands again. Step 9 still
   truncates `lock` and replaces `qm-now.txt`.
 - Step 10 may replace `config.yaml` from the baseline, chmod it to the
-  recorded mode, write `fleet-retirement.conf.removed` (mode `0600`),
-  unlink `fleet-retirement.conf`, and restart the same unit.
+  recorded mode, write `fleet-retirement.conf.removed` (mode `0600`) in
+  the evidence directory, unlink `fleet-retirement.conf`, run
+  `daemon-reload`, and restart the same unit. It does not write that
+  removed copy beside the drop-in. It does not modify journals.
 - Step 11 reads. Steps 12 and 13 repeat steps 2 and 3.
 
 ## 1. Control — baseline
@@ -286,10 +351,15 @@ docs/deploy/c08cb1e_material.py baseline
 
 The preflight must exit 0. `baseline` prints scope, `ActiveState`,
 `SubState`, `MainPID`, `NRestarts` with what that counter measures,
-drop-in names, fleet env key names, `FLEET_CONTROL_PYTHON=absent`, the
-journal manifest checksum, `stable`, `running-root`, and
-`baseline=created` or `baseline=matched`. It ends `STEP 1 OK`. It does
-not restart or create the new checkout.
+drop-in names, validated fleet env key names,
+`fleet-env-unparsed-lines`, `FLEET_CONTROL_PYTHON=absent`, the journal
+manifest checksum, `stable`, `running-root`, and `baseline=created` or
+`baseline=matched`. It checks the stable HEAD and tree pins,
+`/usr/bin/python3.12` outside the agent virtualenv, root for a system
+unit, `NeedDaemonReload=no`, delegation-drop-in location, and that
+`ExecStart`, `WorkingDirectory`, and `EnvironmentFile=` do not pin the
+checkout. It ends `STEP 1 OK`. It does not restart or create the new
+checkout. It stops if `fleet-retirement.conf` is already present.
 
 ## 2. Provisioner — witness
 
@@ -338,13 +408,19 @@ The stable checkout is only read. `NEW` is
 docs/deploy/c08cb1e_material.py install
 ```
 
-If the stable origin has URL userinfo, the command prints
-`origin-embedded-token=present` and `origin-copied=no`, then stops. It
-does not write that URL into the new git config. A credential-free
-origin is copied and not printed. The command then fetches and checks
+The command checks the stable HEAD and tree pins and that
+`/usr/bin/python3.12` resolves outside the agent virtualenv before it
+writes. If the stable origin has URL userinfo, `?`, or `#`, it prints
+`origin-embedded-token=present` or `origin-embedded-token=unknown` and
+`origin-copied=no`, then stops. It does not write that URL into the new
+git config. A credential-free origin, including `ssh://git@host/...`
+with no password, is copied and not printed. Git commands pass
+`safe.directory` for that checkout. The command then fetches and checks
 out the deploy commit, checks `HEAD` and `HEAD^{tree}`, installs the
-locked runtime when the import is missing, and runs `npm ci` only when
-`npm ls` fails. It ends `STEP 4 OK`.
+locked runtime when the import is missing, runs `npm ci` only when
+`npm ls` fails, and requires `git status --porcelain=v1 -uall` to show
+only untracked `runtime/` and `fleet-mcp/node_modules/` paths. It ends
+`STEP 4 OK`.
 
 ## 5. Control — drop-in and config.yaml
 
@@ -352,14 +428,20 @@ locked runtime when the import is missing, and runs `npm ci` only when
 docs/deploy/c08cb1e_material.py configure
 ```
 
-Requires the baseline. Re-checks the journal manifest and
-`fleet-delegation.conf`. Writes `fleet-retirement.conf` beside it only
-if absent (mode `0644`); if present, the bytes must already match.
-Rewrites `config.yaml` only for
-`mcp_servers.<name>.command`, `cwd`, and `args[n]`, by one prefix swap,
-through `config.yaml.c08cb1e-tmp` opened `O_EXCL`, fsync, the original
-mode and owner, then `os.replace`. Prints `config=interpolated`,
-`config=unchanged`, or `config=rewritten`, then `STEP 5 OK`.
+Requires the baseline. Re-checks the journal manifest,
+`fleet-delegation.conf`, profile `.env`, the fleet env, and the unit
+fragment. Holds an exclusive flock on the evidence directory. Writes
+`fleet-retirement.conf.desired`, `config.yaml.deployed`, and
+`config.status` before it edits a live file. Writes
+`fleet-retirement.conf` beside the delegation drop-in only if absent
+(mode `0644`); if present, the bytes must already match. Rewrites
+`config.yaml` only for `mcp_servers.<name>.command`, `cwd`, and
+`args[n]`, by one prefix swap, through `config.yaml.c08cb1e-tmp` opened
+`O_EXCL`, a full write, fsync, chown, the original mode, then
+`os.replace`. An interpolated config is accepted only when the fleet
+MCP entry contains `${HERMES_FLEET_CONTROL_ROOT}`. Prints
+`config=interpolated`, `config=unchanged`, or `config=rewritten`, then
+`STEP 5 OK`.
 
 ## 6. Control — reload and restart only this gateway
 
@@ -367,15 +449,17 @@ mode and owner, then `os.replace`. Prints `config=interpolated`,
 docs/deploy/c08cb1e_material.py restart
 ```
 
-Re-checks journals. If the live root is already the new checkout and
-the drop-in is loaded, prints `restart=skipped` and `STEP 6 OK`.
-Otherwise the root must still be stable. Same scope as step 1:
-`systemctl daemon-reload` and `systemctl restart` (with `--user` when
-step 1 selected the user unit). Requires `ActiveState=active`,
-`SubState=running`, a new `MainPID`, the new root,
-`FLEET_CONTROL_PYTHON` unset, both drop-ins loaded, and the journal
-manifest unchanged. `NRestarts` is printed and is not required to
-increase. Prints `STEP 6 OK`.
+Re-checks journals and the step 1 side files. If the live root is
+already the new checkout and the drop-in is loaded, prints
+`restart=skipped` and `STEP 6 OK`. Otherwise the root must still be
+stable. Same scope as step 1: `systemctl daemon-reload` and
+`systemctl restart` (with `--user` when step 1 selected the user unit).
+Requires `ActiveState=active`, `SubState=running`, a new `MainPID`, the
+new root, `FLEET_CONTROL_PYTHON` unset, both drop-ins loaded, and the
+journal manifest unchanged. It then waits about 10 seconds and requires
+that same `MainPID`, still `active`/`running`, and `NRestarts`
+unchanged from the first post-restart read. `NRestarts` is printed and
+is not required to increase. Prints `STEP 6 OK`.
 
 ## 7. Control — config and status
 
@@ -383,16 +467,16 @@ increase. Prints `STEP 6 OK`.
 docs/deploy/c08cb1e_material.py verify
 ```
 
-Running root is the new checkout. Journals match the baseline.
-`config.yaml` does not name the stable checkout unless step 5 recorded
+Running root is the new checkout. Journals match the baseline. Profile
+`.env`, the fleet env, and the unit fragment match step 1. The new
+checkout's `git status --porcelain=v1 -uall` shows only the allowed
+untracked paths. `config.yaml` matches `config.yaml.deployed` and does
+not name the stable checkout unless step 5 recorded
 `config=interpolated`. Prints `STEP 7 OK`.
 
-List tools with the new MCP SDK only after `STEP 7 OK`, spawning `node`
-on `NEW/fleet-mcp/index.js` with cwd `NEW/fleet-mcp` and env `PATH`,
-`HOME`, and `LANG=C`. Require `worker_status`, `ensure_worker`,
-`onboard_worker`, `delegate_worker`, and `retire_worker`.
-`send_message` must be absent. Do not call a tool. The helper
-`require_tools` enforces that set on the names the client returns.
+This command does not spawn MCP and does not call `require_tools` or
+`project_workers`. Do not treat a tool list or a worker projection as
+a check this procedure completed.
 
 ## 8. Provisioner — witness unchanged
 
@@ -408,18 +492,29 @@ Run the step 3 command again. Require `baseline=matched`.
 docs/deploy/c08cb1e_material.py rollback
 ```
 
-Undo of steps 5 and 6 only. Compares journals first.
+Undo of steps 5 and 6 only. Reads the scope and stable directory from
+the evidence directory, so an inactive or failed unit can roll back.
+`MainPID` 0 is the before value when the unit is not active and
+running. A journal difference prints a warning and
+`journal-warning=changed` or `journal-warning=unreadable`. Rollback
+does not overwrite or delete journal files. Profile `.env`, the fleet
+env, and the unit fragment must still match the baseline or the
+command stops before changing `config.yaml`.
 `fleet-delegation.conf` must match its backup. Restores `config.yaml`
 from the baseline with the same `O_EXCL`, fsync, mode, owner, and
 `os.replace` when the live bytes are the deployed bytes. Any other
 bytes stop. If `fleet-retirement.conf` matches the desired bytes, it
-is copied to `fleet-retirement.conf.removed` and unlinked. If the root
-is already stable, the drop-in is gone, and `config.yaml` is the
-baseline, prints `rollback=already-stable` and `STEP 10 OK` without
-restarting. Otherwise restarts the same scope and requires a new
-`MainPID`, active/running, the stable root, and the retirement drop-in
-absent. `NRestarts` is not required to increase. The new directory
-stays on disk. Journals still match. Prints `STEP 10 OK`.
+is copied to `fleet-retirement.conf.removed` in the evidence directory
+and unlinked. Every path, including the already-stable path, runs
+`daemon-reload` and then requires that `DropInPaths` no longer lists
+the retirement drop-in and `NeedDaemonReload=no`. If the unit was
+already active, the root is stable, the drop-in is gone, and
+`config.yaml` is the baseline, prints `rollback=already-stable` and
+`STEP 10 OK` without restarting. Otherwise restarts the same scope and
+requires a new `MainPID`, active/running, the stable root, and the
+retirement drop-in absent. The restart waits about 10 seconds and
+re-reads. `NRestarts` is not required to increase. The new directory
+stays on disk. Prints `STEP 10 OK`.
 
 ## 11. Control — confirm the stable checkout is running
 
@@ -428,8 +523,10 @@ docs/deploy/c08cb1e_material.py confirm
 ```
 
 Root and tree are the stable pins. The drop-in is not loaded and not
-on disk. Journals match. No gateway process cwd is the new checkout.
-An unreadable cwd stops. Prints `STEP 11 OK`.
+on disk. Journals match. Profile `.env`, the fleet env, and the unit
+fragment match step 1. `config.yaml` is the baseline. No gateway
+process cwd is the new checkout. An unreadable cwd stops. Prints
+`STEP 11 OK`.
 
 ## 12. Provisioner — still unchanged
 
