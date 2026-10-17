@@ -1003,7 +1003,7 @@ class DeployMaterialTests(unittest.TestCase):
             text = stdout.getvalue()
             self.assertEqual(code, 0, text)
             self.assertIn("rollback=already-stable", text)
-            self.assertIn("journal-warning=none", text)
+            self.assertRegex(text, r"(?m)^journal-warning=none$")
             self.assertEqual(journal.read_text(encoding="utf-8"), "journal-v1")
             flat = [" ".join(argv) for argv in commands]
             self.assertTrue(any("daemon-reload" in item for item in flat))
@@ -1135,10 +1135,18 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertNotIn("rollback=done", text)
             self.assertNotIn("STEP 10 OK", text)
             self.assertEqual(config.read_bytes(), before)
-            self.assertFalse(dropin.exists())
+            self.assertEqual(dropin.read_bytes(), b"retirement-v1\n")
+            self.assertIn("dropin-rollback=kept", text)
+            self.assertIn("config-rollback=incomplete", text)
+            self.assertIn("running-root=none", text)
+            self.assertIn("next-start-root=unknown", text)
+            self.assertIn("config-names-new=yes", text)
+            self.assertIn("rollback-completed=none", text)
+            self.assertIn("rollback-incomplete=dropin,config,restart", text)
+            self.assertIn("do not restart the gateway until rollback completes", text)
             self.assertEqual(journal.read_text(encoding="utf-8"), "journal-v1")
             flat = [" ".join(argv) for argv in commands]
-            self.assertFalse(any("restart" in item for item in flat))
+            self.assertFalse(any("daemon-reload" in item or item.endswith("restart " + material.UNIT) for item in flat))
 
     def test_confirm_reports_journal_drift_and_rejects_new_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1234,7 +1242,10 @@ class DeployMaterialTests(unittest.TestCase):
                     ), contextlib.redirect_stderr(stderr):
                         with self.assertRaises(material.Stop):
                             command()
-                    self.assertIn("another deploy command holds the evidence lock", stderr.getvalue())
+                    self.assertIn(
+                        "another deploy command holds the evidence lock; retry after it finishes",
+                        stderr.getvalue(),
+                    )
             finally:
                 holder.kill()
                 holder.wait(timeout=5)
@@ -1243,6 +1254,8 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertEqual(journal.read_bytes(), journal_before)
             for path, data in before.items():
                 self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(material.LOCK_WAIT_SECONDS, 20)
+            self.assertGreater(material.LOCK_WAIT_SECONDS, material.RESTART_SETTLE_SECONDS)
 
     def test_partial_baseline_is_rewritten_and_journals_stay(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1401,6 +1414,301 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertTrue(any(argv[0] == "systemctl" and "--user" in argv for argv in seen))
             self.assertFalse(any(argv[0] == "systemctl" and argv[1:3] == ["start", material.UNIT] for argv in seen))
 
+    def _require_yaml(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML is not installed")
+
+    def _fleet_text(self, root: str, *, command: str | None = None, extra: str = "") -> str:
+        def scalar(value: str) -> str:
+            if any(char in value for char in "${}:#"):
+                return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            return value
+
+        program = command if command is not None else root + "/fleet-mcp/index.js"
+        return (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            f"    command: {scalar(program)}\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {scalar(root + '/fleet-mcp')}\n"
+            + extra
+        )
+
+    def test_rollback_scenario_g_preserves_interpolated_config(self):
+        self._require_yaml()
+        base = self._fleet_text("${HERMES_FLEET_CONTROL_ROOT}", command="node")
+        live = base + "extra: operator\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml").write_bytes(base.encode())
+            (evidence / "config.yaml.deployed").write_bytes(base.encode())
+            config = live_dir / "config.yaml"
+            config.write_text(live, encoding="utf-8")
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            code, text, err, commands = self._failed_rollback(evidence, live_dir)
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("config-rollback=preserved", text)
+            self.assertIn("rollback=done", text)
+            self.assertIn("STEP 10 OK", text)
+            self.assertEqual(config.read_text(encoding="utf-8"), live)
+            self.assertNotIn(str(material.NEW), config.read_text(encoding="utf-8"))
+            self.assertIn("${HERMES_FLEET_CONTROL_ROOT}", config.read_text(encoding="utf-8"))
+            self.assertIn("extra: operator", config.read_text(encoding="utf-8"))
+            self.assertFalse(dropin.exists())
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any(item.endswith("restart " + material.UNIT) for item in flat))
+
+    def test_rollback_scenario_h_preserves_hand_fixed_stable_config(self):
+        self._require_yaml()
+        stable = "/opt/hermes-fleet-control/stable"
+        live = self._fleet_text(stable, extra="extra: operator\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            config = live_dir / "config.yaml"
+            config.write_text(live, encoding="utf-8")
+            before = config.read_bytes()
+            code, text, err, commands = self._failed_rollback(evidence, live_dir)
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("config-rollback=preserved", text)
+            self.assertIn("rollback=done", text)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertNotIn(str(material.NEW), config.read_text(encoding="utf-8"))
+            self.assertIn(stable + "/fleet-mcp", config.read_text(encoding="utf-8"))
+            self.assertIn("extra: operator", config.read_text(encoding="utf-8"))
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any(item.endswith("restart " + material.UNIT) for item in flat))
+
+    def test_rollback_scenario_j_is_idempotent_after_success(self):
+        self._require_yaml()
+        stable = "/opt/hermes-fleet-control/stable"
+        new = str(material.NEW)
+        deployed = self._fleet_text(new)
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            drifted = deployed + "extra: operator\n"
+            config = live_dir / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            code, text, err, _commands = self._failed_rollback(evidence, live_dir)
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("config-rollback=reversed", text)
+            self.assertIn("rollback=done", text)
+            restored = config.read_text(encoding="utf-8")
+            self.assertNotIn(new, restored)
+            self.assertIn("extra: operator", restored)
+            self.assertFalse(dropin.exists())
+            delegation = live_dir / "fleet-delegation.conf"
+            active = self._show(MainPID="77", NRestarts="0", DropInPaths=str(delegation))
+            code, text, err, commands = self._failed_rollback(
+                evidence, live_dir, shows=[dict(active), dict(active)]
+            )
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("config-rollback=preserved", text)
+            self.assertIn("rollback=already-stable", text)
+            self.assertIn("STEP 10 OK", text)
+            self.assertNotIn("rollback=incomplete", text)
+            self.assertEqual(config.read_text(encoding="utf-8"), restored)
+            self.assertFalse(dropin.exists())
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any("daemon-reload" in item for item in flat))
+            self.assertFalse(any(item.endswith("restart " + material.UNIT) for item in flat))
+
+    def test_rollback_rejects_a_cwd_that_is_not_the_stable_checkout(self):
+        self._require_yaml()
+        foreign = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            "    command: node\n"
+            "    args:\n"
+            "      - index.js\n"
+            "    cwd: /tmp/not-stable\n"
+        )
+        third = self._fleet_text("/opt/hermes-fleet-control/other-sha", command="node")
+        for label, body, install_dropin in (
+            ("foreign-cwd", foreign, True),
+            ("third-checkout", third, True),
+            ("absent-dropin", foreign, False),
+        ):
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    evidence, live_dir, _journal = self._evidence(Path(tmp))
+                    config = live_dir / "config.yaml"
+                    config.write_text(body, encoding="utf-8")
+                    before = config.read_bytes()
+                    dropin = live_dir / "fleet-retirement.conf"
+                    if install_dropin:
+                        dropin.write_bytes(b"retirement-v1\n")
+                    code, text, err, commands = self._failed_rollback(evidence, live_dir)
+                    self.assertEqual(code, 1, text + err)
+                    self.assertIn("config-rollback=incomplete", text)
+                    self.assertIn("rollback=incomplete", text)
+                    self.assertIn("next-start-root=" + ("unknown" if install_dropin else "stable"), text)
+                    self.assertIn(
+                        "rollback-incomplete=" + ("dropin,config,restart" if install_dropin else "config,restart"),
+                        text,
+                    )
+                    self.assertNotIn("rollback=done", text)
+                    self.assertNotIn("STEP 10 OK", text)
+                    self.assertEqual(config.read_bytes(), before)
+                    if install_dropin:
+                        self.assertIn("dropin-rollback=kept", text)
+                        self.assertEqual(dropin.read_bytes(), b"retirement-v1\n")
+                    else:
+                        self.assertIn("dropin-rollback=absent", text)
+                        self.assertFalse(dropin.exists())
+                    flat = [" ".join(argv) for argv in commands]
+                    self.assertFalse(any("daemon-reload" in item or "restart" in item for item in flat))
+
+    def test_rollback_scenario_i_unverified_dropin_does_not_rewrite_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            config = live_dir / "config.yaml"
+            before = config.read_bytes()
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"not-the-desired\n")
+            code, text, err, commands = self._failed_rollback(evidence, live_dir)
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("dropin-rollback=unverified", text)
+            self.assertIn("config-rollback=skipped", text)
+            self.assertIn("rollback-reason=retirement drop-in is unverified", text)
+            self.assertIn("running-root=none", text)
+            self.assertIn("next-start-root=unknown", text)
+            self.assertIn("config-names-new=no", text)
+            self.assertIn("rollback-completed=none", text)
+            self.assertIn("rollback-incomplete=dropin,config,restart", text)
+            self.assertIn("do not restart the gateway until rollback completes", text)
+            self.assertIn("rollback=incomplete", text)
+            self.assertNotIn("rollback=done", text)
+            self.assertNotIn("STEP 10 OK", text)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual(dropin.read_bytes(), b"not-the-desired\n")
+            flat = [" ".join(argv) for argv in commands]
+            self.assertFalse(any("daemon-reload" in item or "restart" in item for item in flat))
+
+    def test_rollback_scenario_i2_symlink_dropin_does_not_rewrite_config(self):
+        self._require_yaml()
+        new = str(material.NEW)
+        drifted = self._fleet_text(new) + "extra: operator\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(self._fleet_text(new).encode())
+            config = live_dir / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            before = config.read_bytes()
+            target = live_dir / "retirement-target"
+            target.write_bytes(b"retirement-v1\n")
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.symlink_to(target)
+            code, text, err, commands = self._failed_rollback(evidence, live_dir)
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("dropin-rollback=unverified", text)
+            self.assertIn("config-rollback=skipped", text)
+            self.assertIn("config-names-new=yes", text)
+            self.assertIn("next-start-root=unknown", text)
+            self.assertIn("rollback=incomplete", text)
+            self.assertNotIn("rollback=done", text)
+            self.assertTrue(dropin.is_symlink())
+            self.assertEqual(target.read_bytes(), b"retirement-v1\n")
+            self.assertEqual(config.read_bytes(), before)
+            self.assertIn(new, config.read_text(encoding="utf-8"))
+            flat = [" ".join(argv) for argv in commands]
+            self.assertFalse(any("daemon-reload" in item or "restart" in item for item in flat))
+
+    def test_rollback_inactive_new_journal_file_is_recorded_files_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence, live_dir, journal = self._evidence(root)
+            extra = root / "new-journal.txt"
+            extra.write_text("added-after-baseline", encoding="utf-8")
+            os.chmod(extra, 0o600)
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            code, text, err, _commands = self._failed_rollback(evidence, live_dir)
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("journal-warning=none-recorded-files-only", text)
+            self.assertIn("recorded journal files were rehashed only", text)
+            self.assertNotIn("journal manifest changed", text)
+            self.assertEqual(extra.read_text(encoding="utf-8"), "added-after-baseline")
+            self.assertEqual(journal.read_text(encoding="utf-8"), "journal-v1")
+            self.assertIn("rollback=done", text)
+
+    def test_rollback_accepts_a_mode_755_evidence_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence, live_dir, _journal = self._evidence(root)
+            os.chmod(evidence.parent, 0o755)
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            code, text, err, _commands = self._failed_rollback(evidence, live_dir)
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("rollback=done", text)
+            self.assertFalse(dropin.exists())
+
+    def test_evidence_symlink_permissions_and_owner_stop_before_writes(self):
+        cases = ("symlink", "evidence-mode", "parent-mode", "owner")
+        for label in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    evidence, live_dir, journal = self._evidence(root)
+                    config = live_dir / "config.yaml"
+                    before_config = config.read_bytes()
+                    dropin = live_dir / "fleet-retirement.conf"
+                    dropin.write_bytes(b"retirement-v1\n")
+                    journal_before = journal.read_bytes()
+                    evidence_path: Path = evidence
+                    if label == "symlink":
+                        evidence_path = root / "linked-evidence"
+                        evidence_path.symlink_to(evidence, target_is_directory=True)
+                    elif label == "evidence-mode":
+                        os.chmod(evidence, 0o777)
+                    elif label == "parent-mode":
+                        os.chmod(evidence.parent, 0o777)
+                    stderr = io.StringIO()
+
+                    def explode(*_args, **_kwargs):
+                        raise AssertionError("host command ran")
+
+                    with unittest.mock.patch.object(
+                        material, "evidence_root", lambda evidence_path=evidence_path: evidence_path
+                    ), unittest.mock.patch.object(
+                        material, "systemctl_show", explode
+                    ), unittest.mock.patch.object(material, "_run", explode), unittest.mock.patch.object(
+                        material.os,
+                        "geteuid",
+                        return_value=os.geteuid() + 1 if label == "owner" else os.geteuid(),
+                    ), contextlib.redirect_stderr(stderr):
+                        for command in (
+                            material.cmd_baseline,
+                            material.cmd_configure,
+                            material.cmd_restart,
+                            material.cmd_verify,
+                            material.cmd_rollback,
+                            material.cmd_confirm,
+                        ):
+                            with self.assertRaises(material.Stop):
+                                command()
+                    message = stderr.getvalue()
+                    if label == "symlink":
+                        self.assertIn("evidence directory is a symlink", message)
+                    elif label == "evidence-mode":
+                        self.assertIn("evidence directory is group or world writable", message)
+                    elif label == "parent-mode":
+                        self.assertIn("evidence parent is group or world writable", message)
+                    else:
+                        self.assertIn("owner is not the deploying user", message)
+                    self.assertEqual(config.read_bytes(), before_config)
+                    self.assertEqual(dropin.read_bytes(), b"retirement-v1\n")
+                    self.assertEqual(journal.read_bytes(), journal_before)
+                    if label == "parent-mode":
+                        os.chmod(evidence.parent, 0o700)
+
     def test_guest_node_witness_reports_a_held_lock(self):
         witness = ROOT / "docs" / "deploy" / "c08cb1e-guest-node-witness.sh"
         stub = Path(tempfile.mkdtemp())
@@ -1409,9 +1717,11 @@ class DeployMaterialTests(unittest.TestCase):
         os.chmod(stub / "qm", 0o755)
         os.chmod(stub / "systemctl", 0o755)
         path = str(stub) + ":" + os.environ["PATH"]
+        rounds = 30
         inner = textwrap.dedent(
             f"""\
             set -euo pipefail
+            set -m
             saved=$(mktemp -d)
             mount --bind /etc/alternatives "$saved"
             newetc=$(mktemp -d)
@@ -1424,25 +1734,38 @@ class DeployMaterialTests(unittest.TestCase):
             bash {witness}
             evidence=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness
             digest=$(sha256sum "$evidence/qm-baseline.txt")
-            flock -n "$evidence/lock" sleep 30 &
+            cleanup() {{
+              if [[ -n "${{holder:-}}" ]]; then
+                kill -- -"$holder" 2>/dev/null || true
+              fi
+            }}
+            trap cleanup EXIT
+            bash -c 'flock "$1" bash -c "echo held > \\"$2\\"; exec sleep 3600"' _ "$evidence/lock" /var/lib/ready &
             holder=$!
-            held=no
-            for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-              if ! flock -n "$evidence/lock" true; then
-                held=yes
+            ready=no
+            for _try in $(seq 1 50); do
+              if [[ -s /var/lib/ready ]]; then
+                ready=yes
                 break
               fi
               sleep 0.05
             done
-            set +e
-            bash {witness} >/var/lib/second.out 2>/var/lib/second.err
-            status=$?
-            set -e
-            echo status=$status
-            echo held=$held
+            test "$ready" = yes
+            ok=0
+            for _round in $(seq 1 {rounds}); do
+              set +e
+              bash {witness} >/var/lib/second.out 2>/var/lib/second.err
+              status=$?
+              set -e
+              test "$status" = 1
+              grep -q "STOP: evidence lock is held" /var/lib/second.err
+              ok=$((ok + 1))
+            done
+            echo status=1
+            echo held=$ready
+            echo rounds=$ok
             echo digest-same=$(test "$(sha256sum "$evidence/qm-baseline.txt")" = "$digest" && echo yes || echo no)
             cat /var/lib/second.err
-            kill "$holder"
             """
         )
         completed = subprocess.run(
@@ -1454,6 +1777,7 @@ class DeployMaterialTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn("status=1", completed.stdout)
         self.assertIn("held=yes", completed.stdout)
+        self.assertIn("rounds=" + str(rounds), completed.stdout)
         self.assertIn("STOP: evidence lock is held", completed.stdout)
         self.assertIn("digest-same=yes", completed.stdout)
 

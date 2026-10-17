@@ -32,11 +32,16 @@ revision it checks is skipped. Rollback does not delete journals,
 reservations, tombstones, profile files, or the stable checkout. It
 does not overwrite a profile `.env`, the fleet env file, the unit
 fragment, or `fleet-delegation.conf`. A difference in those files is
-a warning. Rollback still removes a verified `fleet-retirement.conf`
-and restores or reverse-rewrites `config.yaml` when that rewrite is
-safe. If `config.yaml` still names the new checkout, or the retirement
-drop-in cannot be verified, rollback is incomplete: it does not restart
-the gateway and it does not print `STEP 10 OK`.
+a warning. Rollback classifies the retirement drop-in and `config.yaml`
+before it writes either one. It removes a verified
+`fleet-retirement.conf` and restores or reverse-rewrites `config.yaml`
+only when the resulting fleet MCP command, cwd, and args reference the
+stable checkout. A file that already does, including unrelated edits,
+is left in place (`config-rollback=preserved`). An unverified drop-in
+or a config that is not stable-compatible leaves both files untouched.
+Rollback does not restart, and it does not print `rollback=done` or
+`STEP 10 OK`, until the stable gateway is healthy. Re-running rollback
+after that success prints `rollback=already-stable`.
 
 ## Pins
 
@@ -260,8 +265,12 @@ names and paths may be printed. Do not print values whose keys match
   stop when the sha256 manifest does not match `journals.manifest`.
   Rollback and confirm print a journal warning (`journal-warning=changed`
   or `journal-warning=unreadable`) and do not overwrite or delete
-  journal files. New journal entries do not by themselves fail rollback
-  or confirm.
+  journal files. When the unit is not active, only files already named
+  in the manifest are rehashed. A match in that case prints
+  `journal-warning=none-recorded-files-only` and warns that a new
+  journal file was not scanned. A live match prints
+  `journal-warning=none`. New journal entries do not by themselves fail
+  rollback or confirm.
 - The stable git origin has URL userinfo other than an `ssh://`
   username with no password, contains `?`, `#`, or `;`, or its form is
   unknown.
@@ -275,8 +284,13 @@ names and paths may be printed. Do not print values whose keys match
   as `config.yaml.deployed`. Rollback does not stop on delegation drift.
   For `config.yaml`, rollback restores the baseline when the live bytes
   are the deployed bytes, reverse-rewrites fleet MCP paths when that
-  swap is safe, and otherwise leaves the file in place and reports an
-  incomplete rollback.
+  swap leaves the fleet command, cwd, and args on the stable checkout,
+  and leaves that file untouched when those three fields already
+  reference the stable checkout or `${HERMES_FLEET_CONTROL_ROOT}`
+  (`config-rollback=preserved`). Absence of the new checkout path is
+  not enough: a different checkout, or a cwd that is neither the stable
+  directory nor that variable, is incomplete. Unrelated keys are kept.
+  An unverified retirement drop-in skips the config write.
 - `git status --porcelain=v1 -uall` on the new checkout, checked by
   install and verify, shows anything outside untracked `runtime/` and
   `fleet-mcp/node_modules/`.
@@ -307,9 +321,16 @@ directory aside. A new baseline is valid only while
 
 `baseline`, `configure`, `restart`, `verify`, `rollback`, and
 `confirm` take one exclusive flock on the parent of the evidence
-directory and wait up to 5 seconds. If another command holds it, the
-new command prints `STOP: another deploy command holds the evidence
-lock` and exits 1.
+directory and wait up to 20 seconds, which is longer than the restart
+settle. If another command holds it, the new command prints
+`STOP: another deploy command holds the evidence lock; retry after it finishes`
+and exits 1. Before taking that lock, each of those commands `lstat`s
+the evidence parent and, when it already exists, the evidence
+directory. A symlink, a non-directory, a directory owned by another
+user, or a group-writable or world-writable directory stops the
+command before any evidence or live write. An existing unsafe parent
+is not chmod'd. `0755` is accepted. The lock file descriptor is opened
+with `O_DIRECTORY|O_NOFOLLOW`.
 
 Fleet env output is `fleet-env-name-count`, `fleet-env-names-sha256`
 (the sha256 of the sorted unique validated names, one per line),
@@ -378,12 +399,15 @@ replaced. It does not mean that run wrote nothing.
   the recorded mode, write `fleet-retirement.conf.removed` (mode
   `0600`) in the evidence directory, and unlink
   `fleet-retirement.conf` only when that file's bytes match the
-  desired copy and it is not a symlink. It may run `daemon-reload`
-  and restart the same unit. It does not write the removed copy
-  beside the drop-in. It does not modify journals, reservations,
-  tombstones, identities, credentials, profile `.env`, the fleet env,
-  the unit fragment, or `fleet-delegation.conf`. An incomplete
-  rollback does not restart.
+  desired copy and it is not a symlink. Those writes happen only after
+  both the drop-in and the config plan are safe. A preserved config is
+  not written. An unverified drop-in is not removed, and in that case
+  `config.yaml` is not written either. It may run `daemon-reload`
+  and restart the same unit only after those writes. It does not write
+  the removed copy beside the drop-in. It does not modify journals,
+  reservations, tombstones, identities, credentials, profile `.env`,
+  the fleet env, the unit fragment, or `fleet-delegation.conf`. An
+  incomplete rollback does not restart and does not reload.
 - Step 11 reads. Steps 12 and 13 repeat steps 2 and 3.
 
 ## 1. Control — baseline
@@ -546,40 +570,90 @@ Undo of steps 5 and 6 only. Reads the scope and stable directory from
 the evidence directory, so an inactive or failed unit can roll back.
 `MainPID` 0 is the before value when the unit is not active and
 running. A journal difference prints a warning and
-`journal-warning=changed` or `journal-warning=unreadable`. Rollback
-does not overwrite or delete journal files. Profile `.env`, the fleet
-env, and the unit fragment may differ. That prints
+`journal-warning=changed` or `journal-warning=unreadable`. When the
+unit is inactive and the recorded files still match, the warning is
+`journal-warning=none-recorded-files-only`: only those files were
+rehashed, and a journal file that is not in the manifest is not
+detected. Rollback does not overwrite or delete journal files. Profile
+`.env`, the fleet env, and the unit fragment may differ. That prints
 `WARNING: side file differs from baseline; rollback will not modify it`
 and `side-file-drift=` with the drifted labels, or `side-file-drift=none`.
 Those files are not written. A delegation difference prints a warning
-and `delegation-drift=changed` and is not written. The retirement
-drop-in is removed only when it is the sibling
+and `delegation-drift=changed` and is not written.
+
+Rollback plans both writes before it changes either file. The
+retirement drop-in is removable only when it is the sibling
 `fleet-retirement.conf` of the stored delegation path, it is not a
-symlink, and its bytes equal `fleet-retirement.conf.desired`. The
-removed bytes are copied to `fleet-retirement.conf.removed` in the
-evidence directory first. Any other drop-in state prints
-`dropin-rollback=unverified` and is left on disk.
-`config.yaml` is restored from the baseline, with the recorded mode,
-when the live bytes are `config.yaml.deployed`. When the live bytes
-are already the baseline, it is left alone (`config-rollback=unchanged`).
-Other bytes get one reverse rewrite of the fleet MCP `command`, `cwd`,
-and `args` that name the new checkout, leaving unrelated keys in
-place (`config-rollback=reversed`). If that rewrite is not safe, or
-PyYAML is not already installed, the file is left unchanged
-(`config-rollback=incomplete`). When the drop-in was removed or was
-already absent, `daemon-reload` runs and `DropInPaths` must no longer
-list it, with `NeedDaemonReload=no`. If the drop-in is unverified, the
-config rewrite is incomplete, or `config.yaml` still names the new
-checkout, the command prints `rollback=incomplete`, prints
-`STOP: rollback incomplete; operator intervention required`, and does
-not restart. If the unit was already active, the root is stable, the
-drop-in was already absent, and `config.yaml` was already the
-baseline, it prints `rollback=already-stable` and `STEP 10 OK` without
-restarting. Otherwise it restarts the same scope and requires a new
-`MainPID`, active/running, the stable root, and the retirement drop-in
-absent. The restart waits about 10 seconds and re-reads. `NRestarts`
-is not required to increase. The new directory stays on disk. A
-successful rollback prints `STEP 10 OK`. An incomplete one does not.
+symlink, and its bytes equal `fleet-retirement.conf.desired`. Any
+other state is `unverified`. `config.yaml` is classified as
+`unchanged` when the live bytes are the baseline and do not name the
+new checkout, `restored` when the live bytes are
+`config.yaml.deployed` and the baseline does not name the new
+checkout, `reversed` when one safe swap of the new checkout path back
+to the stable directory leaves a stable-compatible fleet MCP entry,
+or `preserved` when the live bytes differ but the fleet MCP `command`,
+`cwd`, and `args` already reference the stable directory or
+`${HERMES_FLEET_CONTROL_ROOT}`. Unrelated keys stay. A third
+`/opt/hermes-fleet-control/` checkout, a cwd outside that anchor, or a
+missing PyYAML install is `incomplete`. The new checkout path anywhere
+else in the file is also `incomplete`.
+
+If the drop-in is unverified, or the config plan is incomplete, the
+command writes nothing. It does not remove the drop-in, does not
+rewrite `config.yaml`, does not `daemon-reload`, and does not restart.
+It prints `running-root` (`new`, `stable`, `none`, or `unknown`),
+`next-start-root` (`stable` when the drop-in is absent, `new` when the
+on-disk drop-in matches the desired bytes and sets the root to the new
+checkout, otherwise `unknown`), `config-names-new` (`yes`, `no`, or
+`unknown`), `rollback-completed`, `rollback-incomplete`,
+`dropin-rollback` (`unverified`, `kept`, or `absent`),
+`config-rollback` (`skipped` or `incomplete`), and `rollback-reason`.
+It then prints `WARNING: do not restart the gateway until rollback completes`,
+`rollback=incomplete`, and
+`STOP: rollback incomplete; operator intervention required`.
+
+When both plans are safe, a `restored` or `reversed` config is written
+first. A `preserved` or `unchanged` config is not written.
+`config-rollback=preserved` also prints a warning that the file was
+kept. A removable drop-in is then copied to
+`fleet-retirement.conf.removed` in the evidence directory and unlinked
+(`dropin-rollback=removed`). `daemon-reload` runs and `DropInPaths`
+must no longer list the retirement drop-in, with `NeedDaemonReload=no`.
+If the unit was already active and running, the root was already
+stable, `FLEET_CONTROL_PYTHON` was unset, delegation was loaded, the
+drop-in was already absent, and the config was `unchanged` or
+`preserved`, the command prints `rollback=already-stable` and
+`STEP 10 OK` without restarting. Otherwise it restarts the same scope
+and requires a new `MainPID`, active/running, the stable root,
+delegation loaded, the retirement drop-in unloaded, and
+`FLEET_CONTROL_PYTHON` unset. The restart waits about 10 seconds and
+re-reads. `NRestarts` is not required to increase. The new directory
+stays on disk. `rollback=done` and `STEP 10 OK` are printed only after
+that health check passes. Re-running the command after that success is
+safe: the config is `unchanged` or `preserved`, the drop-in is absent,
+and the command prints `rollback=already-stable`.
+
+### Recovery when rollback is incomplete
+
+Do not run `systemctl restart` while the command printed
+`rollback=incomplete`. Use the printed `running-root`,
+`next-start-root`, and `config-names-new` lines. Do not paste
+`config.yaml`, the drop-in, or an env file into chat.
+
+If `dropin-rollback=unverified`, compare `fleet-retirement.conf` with
+the evidence file `fleet-retirement.conf.desired` on the host. Do not
+delete the drop-in unless it is a regular file and its bytes match
+that desired file. Rollback will not delete an unverified drop-in and
+will not rewrite `config.yaml` until the drop-in is verified or absent.
+
+If `config-names-new=yes`, edit only the fleet MCP `command`, `cwd`,
+and `args` so they name the stable checkout or
+`${HERMES_FLEET_CONTROL_ROOT}`. Leave unrelated keys in place. Re-run
+rollback. A compatible file prints `config-rollback=preserved` and is
+not rewritten. When the drop-in is the verified desired file, that
+re-run removes it, reloads, and restarts the stable gateway.
+`rollback=done` is printed only after that restart passes its health
+checks. Then run step 11.
 
 ## 11. Control — confirm the stable checkout is running
 
@@ -593,9 +667,10 @@ checkout, and `FLEET_CONTROL_PYTHON` is unset. `fleet-delegation.conf`
 is loaded. The retirement drop-in is not loaded and not on disk.
 `NeedDaemonReload=no`. A journal difference prints a warning and does
 not fail the command. Side-file drift is the same warning as rollback
-and is not modified. `config.yaml` must not name the new checkout; it
-does not have to be byte-for-byte the baseline when a reverse rewrite
-preserved unrelated keys. No gateway process cwd is the new checkout.
+and is not modified. `config.yaml` must not name the new checkout. It does not have to be
+byte-for-byte the baseline when a reverse rewrite or a preserved file
+kept unrelated keys, as long as the fleet MCP command, cwd, and args
+reference the stable checkout. No gateway process cwd is the new checkout.
 An unreadable cwd stops. Prints `STEP 11 OK`.
 
 ## 12. Provisioner — still unchanged

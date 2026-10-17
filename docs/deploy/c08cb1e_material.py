@@ -62,7 +62,8 @@ HOST_RE = re.compile(r"^[A-Za-z0-9.-]+(?::[0-9]+)?$")
 FIXED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 AGENT_VENV = Path("/home/hermes/.hermes/hermes-agent/venv")
 RESTART_SETTLE_SECONDS = 10
-LOCK_WAIT_SECONDS = 5
+LOCK_WAIT_SECONDS = 20
+FLEET_ROOT_VAR = "${HERMES_FLEET_CONTROL_ROOT}"
 REQUIRED_ENV_KEYS = (
     "FLEET_PROVISIONER_URL",
     "FLEET_PROVISIONER_CALLER_TOKEN",
@@ -1658,30 +1659,56 @@ def require_side_files(evidence: Path) -> None:
         require_bytes(stored_path(evidence, label), (evidence / copy).read_bytes(), label, private=private)
 
 
+def _require_owned_dir(path: Path, label: str) -> None:
+    """Reject a symlink, a non-directory, a foreign owner, or group/world write.
+
+    Uses lstat so a symlink is not followed. A mode of 0755 is accepted.
+    Group-write and world-write bits are not.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        die(label + " is not lockable")
+    if stat.S_ISLNK(info.st_mode):
+        die(label + " is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        die(label + " is not a directory")
+    if info.st_uid != os.geteuid():
+        die(label + " owner is not the deploying user")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        die(label + " is group or world writable")
+
+
 def _lock_parent(create: bool) -> int:
     """Exclusive flock on the evidence parent. Wait is bounded.
 
     baseline may create the parent. Other commands stop when it is absent.
     The same lock covers baseline, configure, restart, verify, rollback,
-    and confirm.
+    and confirm. The parent must be a directory this user owns, not a
+    symlink, and not group or world writable. An existing unsafe parent
+    is refused rather than chmod'd.
     """
     parent = evidence_root().parent
-    if parent.is_symlink():
-        die("evidence directory is not lockable")
-    created = False
-    if not parent.exists():
+    missing = False
+    try:
+        os.lstat(parent)
+    except FileNotFoundError:
+        missing = True
+    except OSError:
+        die("evidence parent is not lockable")
+    if missing:
         if not create:
             die("baseline is missing")
-        parent.mkdir(parents=True, exist_ok=True)
-        created = True
-    if parent.is_symlink() or not parent.is_dir():
-        die("evidence directory is not lockable")
-    if created:
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            die("evidence parent is not lockable")
         os.chmod(parent, 0o700)
+    _require_owned_dir(parent, "evidence parent")
     try:
-        fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
-        die("evidence directory is not lockable")
+        die("evidence parent is not lockable")
     deadline = time.monotonic() + LOCK_WAIT_SECONDS
     while True:
         try:
@@ -1691,16 +1718,33 @@ def _lock_parent(create: bool) -> int:
             pass
         except OSError:
             os.close(fd)
-            die("evidence directory is not lockable")
+            die("evidence parent is not lockable")
         if time.monotonic() >= deadline:
             os.close(fd)
-            die("another deploy command holds the evidence lock")
+            die("another deploy command holds the evidence lock; retry after it finishes")
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
+def _require_evidence_dir() -> None:
+    """When the evidence directory exists, it must be a private directory we own.
+
+    Absence is left for the command. A symlink is refused before any write.
+    """
+    evidence = evidence_root()
+    try:
+        os.lstat(evidence)
+    except FileNotFoundError:
+        return
+    except OSError:
+        die("evidence directory is not lockable")
+    _require_owned_dir(evidence, "evidence directory")
+
+
 def _run_locked(body, *, create: bool = False) -> int:
+    _require_evidence_dir()
     lock = _lock_parent(create)
     try:
+        _require_evidence_dir()
         return body()
     finally:
         os.close(lock)
@@ -1731,7 +1775,12 @@ def rehash_recorded(recorded: str) -> str:
 
 
 def journal_difference(env: dict[str, str] | None, recorded: str) -> str:
-    """none, changed, or unreadable. Swallows the integrity stop so rollback can warn."""
+    """none, none-recorded-files-only, changed, or unreadable.
+
+    A live environment is re-listed. Without one, only paths already named
+    in the manifest are rehashed, so a new journal file is not detected.
+    Swallows the integrity stop so rollback can warn.
+    """
     sink = sys.stderr
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
     try:
@@ -1742,11 +1791,20 @@ def journal_difference(env: dict[str, str] | None, recorded: str) -> str:
     finally:
         sys.stderr.close()
         sys.stderr = sink
-    return "none" if current == recorded else "changed"
+    if current != recorded:
+        return "changed"
+    if env is None:
+        return "none-recorded-files-only"
+    return "none"
 
 
 def warn_journals(kind: str, *, action: str = "rollback") -> None:
-    if kind != "none":
+    if kind == "none-recorded-files-only":
+        warn(
+            "recorded journal files were rehashed only; new journal files were not "
+            "scanned and journals will not be modified"
+        )
+    elif kind != "none":
         warn("journal manifest changed; " + action + " will not modify journals")
     out("journal-warning=" + kind)
 
@@ -2412,49 +2470,244 @@ def _reverse_fleet_paths(live: bytes, stable_dir: str) -> bytes | None:
     return updated.encode("utf-8")
 
 
-def _rollback_config(evidence: Path, config: Path, stable_dir: str) -> str:
-    """restored, unchanged, reversed, or incomplete. Does not print config text."""
-    baseline = (evidence / "config.yaml").read_bytes()
+def _load_yaml_quiet(text: str) -> dict | None:
+    """Parse a mapping without printing the text or stopping the command."""
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _anchored(value: str, stable_dir: str) -> bool:
+    """True when value is the stable checkout, the checkout variable, or a child of either."""
+    if not value or ".." in value.split("/"):
+        return False
+    if value == stable_dir or value.startswith(stable_dir + "/"):
+        return True
+    if value == FLEET_ROOT_VAR or value.startswith(FLEET_ROOT_VAR + "/"):
+        return True
+    return False
+
+
+def _foreign_checkout(text: str, stable_dir: str) -> bool:
+    """True when text names the new checkout or any other fleet checkout."""
+    if str(NEW) in text:
+        return True
+    for match in re.finditer(r"/opt/hermes-fleet-control/[A-Za-z0-9._/-]*", text):
+        path = match.group(0).rstrip("/")
+        if path == stable_dir or path.startswith(stable_dir + "/"):
+            continue
+        return True
+    return False
+
+
+def _mcp_field_strings(server: dict) -> list[str] | None:
+    fields: list[str] = []
+    command = server.get("command")
+    cwd = server.get("cwd")
+    if not isinstance(command, str) or not isinstance(cwd, str):
+        return None
+    fields.extend((command, cwd))
+    args = server.get("args", [])
+    if args is None:
+        args = []
+    if not isinstance(args, list):
+        return None
+    for item in args:
+        if not isinstance(item, str):
+            return None
+        fields.append(item)
+    return fields
+
+
+def _command_ok(command: str, stable_dir: str) -> bool:
+    if command in PUBLIC_MCP or _anchored(command, stable_dir):
+        return True
+    if command.startswith("/") and "/opt/hermes-fleet-control/" not in command:
+        return True
+    return False
+
+
+def _arg_ok(arg: str, stable_dir: str) -> bool:
+    if _anchored(arg, stable_dir):
+        return True
+    if "/" not in arg and FLEET_ROOT_VAR not in arg:
+        return True
+    if arg.startswith("/") and "/opt/hermes-fleet-control/" not in arg:
+        return True
+    return False
+
+
+def _fleet_mcp_compatible(text: str, stable_dir: str) -> bool:
+    """True when the one fleet MCP entry already targets the stable checkout.
+
+    Absence of the new checkout path is not enough. cwd must be the stable
+    directory, `${HERMES_FLEET_CONTROL_ROOT}`, or a child of one of those.
+    command and args must be that same anchor, a public interpreter, a
+    basename, or an absolute path outside the fleet checkouts. Any other
+    `/opt/hermes-fleet-control/` checkout, including the new one, is rejected.
+    """
+    if not stable_dir.startswith("/opt/hermes-fleet-control/") or stable_dir == str(NEW):
+        return False
+    if ".." in stable_dir.split("/"):
+        return False
+    if _foreign_checkout(text, stable_dir):
+        return False
+    data = _load_yaml_quiet(text)
+    if data is None:
+        return False
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict) or not servers:
+        return False
+    fleet: list[dict] = []
+    for name, server in servers.items():
+        if not isinstance(name, str) or not isinstance(server, dict):
+            return False
+        fields = _mcp_field_strings(server)
+        if fields is None:
+            return False
+        if any(_anchored(item, stable_dir) for item in fields):
+            fleet.append(server)
+    if len(fleet) != 1:
+        return False
+    server = fleet[0]
+    cwd = server.get("cwd")
+    command = server.get("command")
+    if not isinstance(cwd, str) or not isinstance(command, str):
+        return False
+    if not _anchored(cwd, stable_dir) or not _command_ok(command, stable_dir):
+        return False
+    args = server.get("args", [])
+    if args is None:
+        args = []
+    if not isinstance(args, list):
+        return False
+    return all(isinstance(item, str) and _arg_ok(item, stable_dir) for item in args)
+
+
+def _config_plan(evidence: Path, config: Path, stable_dir: str) -> tuple[str, bytes | None]:
+    """unchanged, restored, reversed, preserved, or incomplete. Does not write.
+
+    preserved means the live file is not the baseline but its fleet MCP
+    command, cwd, and args already target the stable checkout. The bytes
+    to write are returned only for restored and reversed.
+    """
+    baseline_file = evidence / "config.yaml"
+    if baseline_file.is_symlink() or not baseline_file.is_file():
+        return "incomplete", None
+    baseline = baseline_file.read_bytes()
     deployed_file = evidence / "config.yaml.deployed"
     deployed = deployed_file.read_bytes() if deployed_file.is_file() and not deployed_file.is_symlink() else None
-    if config.is_symlink() or not config.is_file():
-        out("config-rollback=incomplete")
-        return "incomplete"
-    live = config.read_bytes()
-    if live == baseline:
-        out("config-rollback=unchanged")
-        return "unchanged"
-    if deployed is not None and live == deployed:
-        atomic_replace(config, baseline)
-        os.chmod(config, int((evidence / "config.mode").read_text(encoding="utf-8").strip()))
-        out("config-rollback=restored")
-        return "restored"
+    try:
+        info = os.lstat(config)
+    except OSError:
+        return "incomplete", None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return "incomplete", None
+    try:
+        live = config.read_bytes()
+    except OSError:
+        return "incomplete", None
+    if live == baseline and str(NEW).encode() not in live:
+        return "unchanged", None
+    if deployed is not None and live == deployed and str(NEW).encode() not in baseline:
+        return "restored", baseline
     reversed_bytes = _reverse_fleet_paths(live, stable_dir)
-    if reversed_bytes is None:
-        out("config-rollback=incomplete")
-        return "incomplete"
-    atomic_replace(config, reversed_bytes)
-    out("config-rollback=reversed")
-    return "reversed"
+    if reversed_bytes is not None and str(NEW).encode() not in reversed_bytes:
+        try:
+            reversed_text = reversed_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            reversed_text = ""
+        if reversed_text and _fleet_mcp_compatible(reversed_text, stable_dir):
+            return "reversed", reversed_bytes
+    try:
+        text = live.decode("utf-8")
+    except UnicodeDecodeError:
+        return "incomplete", None
+    if _fleet_mcp_compatible(text, stable_dir):
+        return "preserved", None
+    return "incomplete", None
 
 
-def _rollback_dropin(evidence: Path, delegation: Path) -> str:
-    """removed, absent, or unverified. Unverified bytes are left on disk."""
+def _dropin_plan(evidence: Path, delegation: Path) -> str:
+    """absent, removable, or unverified. Does not unlink or print."""
     dropin = delegation.with_name("fleet-retirement.conf")
-    if dropin.is_symlink():
-        out("dropin-rollback=unverified")
-        return "unverified"
-    if not dropin.exists():
-        out("dropin-rollback=absent")
+    try:
+        info = os.lstat(dropin)
+    except FileNotFoundError:
         return "absent"
-    desired_file = evidence / "fleet-retirement.conf.desired"
-    if not desired_file.is_file() or desired_file.is_symlink() or dropin.read_bytes() != desired_file.read_bytes():
-        out("dropin-rollback=unverified")
+    except OSError:
         return "unverified"
-    _private_write(evidence / "fleet-retirement.conf.removed", dropin.read_bytes())
-    dropin.unlink()
-    out("dropin-rollback=removed")
-    return "removed"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return "unverified"
+    desired_file = evidence / "fleet-retirement.conf.desired"
+    try:
+        desired_info = os.lstat(desired_file)
+    except OSError:
+        return "unverified"
+    if stat.S_ISLNK(desired_info.st_mode) or not stat.S_ISREG(desired_info.st_mode):
+        return "unverified"
+    try:
+        if dropin.read_bytes() != desired_file.read_bytes():
+            return "unverified"
+    except OSError:
+        return "unverified"
+    return "removable"
+
+
+def _apply_config(evidence: Path, config: Path, status: str, payload: bytes | None) -> None:
+    if status == "restored":
+        if payload is None:
+            die("config restore has no payload")
+        atomic_replace(config, payload)
+        os.chmod(config, int((evidence / "config.mode").read_text(encoding="utf-8").strip()))
+        return
+    if status == "reversed":
+        if payload is None:
+            die("config reverse has no payload")
+        atomic_replace(config, payload)
+        return
+    if status == "preserved":
+        warn(
+            "config.yaml is not the baseline; fleet MCP command, cwd, and args "
+            "already reference the stable checkout"
+        )
+
+
+def _apply_dropin_removal(evidence: Path, delegation: Path) -> None:
+    """Copy a verified regular drop-in into evidence, then unlink it. Do not follow a symlink."""
+    dropin = delegation.with_name("fleet-retirement.conf")
+    try:
+        info = os.lstat(dropin)
+    except OSError:
+        die("retirement drop-in changed")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        die("retirement drop-in changed")
+    fd = os.open(str(dropin), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        chunks: list[bytes] = []
+        remaining = info.st_size
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+    desired = _desired_dropin_bytes(evidence)
+    if desired is None or data != desired:
+        die("retirement drop-in changed")
+    _private_write(evidence / "fleet-retirement.conf.removed", data)
+    os.unlink(dropin)
 
 
 def _config_names_new(config: Path) -> bool:
@@ -2465,6 +2718,80 @@ def _config_names_new(config: Path) -> bool:
     except OSError:
         return True
     return str(NEW) in text
+
+
+def _config_names_label(config: Path) -> str:
+    """yes, no, or unknown. Does not print file text."""
+    try:
+        info = os.lstat(config)
+    except OSError:
+        return "unknown"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return "unknown"
+    try:
+        text = config.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "unknown"
+    return "yes" if str(NEW) in text else "no"
+
+
+def _running_root(before: int, env: dict[str, str] | None, stable: str) -> str:
+    """new, stable, none, or unknown. none means no running gateway process."""
+    if before <= 1 or env is None:
+        return "none"
+    root = env.get("HERMES_FLEET_CONTROL_ROOT", "")
+    if root == str(NEW):
+        return "new"
+    if root == stable:
+        return "stable"
+    return "unknown"
+
+
+def _next_start_root(dropin: Path, desired: bytes | None) -> str:
+    """Checkout the next start would use, from the retirement drop-in only.
+
+    Absent means the retirement override is not installed, so the next
+    start uses the stable unit. A regular file that matches the desired
+    bytes and sets the root to the new checkout means new. Anything else
+    is unknown. The file body is not printed.
+    """
+    try:
+        info = os.lstat(dropin)
+    except FileNotFoundError:
+        return "stable"
+    except OSError:
+        return "unknown"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or desired is None:
+        return "unknown"
+    try:
+        live = dropin.read_bytes()
+    except OSError:
+        return "unknown"
+    if live != desired:
+        return "unknown"
+    needle = "Environment=HERMES_FLEET_CONTROL_ROOT=" + str(NEW)
+    roots = [
+        line.split("=", 2)[-1]
+        for line in live.decode("utf-8", errors="replace").splitlines()
+        if line.startswith("Environment=HERMES_FLEET_CONTROL_ROOT=")
+    ]
+    if roots == [str(NEW)] and needle.encode() in live:
+        return "new"
+    return "unknown"
+
+
+def _desired_dropin_bytes(evidence: Path) -> bytes | None:
+    desired = evidence / "fleet-retirement.conf.desired"
+    try:
+        info = os.lstat(desired)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None
+    try:
+        return desired.read_bytes()
+    except OSError:
+        return None
 
 
 def _confirm_dropin_unloaded(user: bool) -> dict[str, str]:
@@ -2479,7 +2806,53 @@ def _confirm_dropin_unloaded(user: bool) -> dict[str, str]:
     return shown
 
 
-def _rollback_incomplete() -> None:
+def _gateway_already_stable(shown: dict[str, str], stable: str, config_status: str, dropin_plan: str) -> bool:
+    """True when this run changed nothing and the stable gateway is already healthy."""
+    if dropin_plan != "absent" or config_status not in {"unchanged", "preserved"}:
+        return False
+    if shown.get("ActiveState") != "active" or shown.get("SubState") != "running":
+        return False
+    if shown.get("NeedDaemonReload") != "no":
+        return False
+    if "fleet-delegation.conf" not in dropin_names(shown):
+        return False
+    if any(Path(part).name == "fleet-retirement.conf" for part in shown.get("DropInPaths", "").split()):
+        return False
+    try:
+        pid = int(shown.get("MainPID", "0"))
+    except ValueError:
+        return False
+    if pid <= 1:
+        return False
+    env = read_environ(pid)
+    if env is None or env.get("HERMES_FLEET_CONTROL_ROOT") != stable:
+        return False
+    if str(env.get("FLEET_CONTROL_PYTHON", "")).strip():
+        return False
+    return True
+
+
+def _rollback_refuse(
+    *,
+    running: str,
+    next_start: str,
+    names_new: str,
+    dropin_status: str,
+    config_status: str,
+    reason: str,
+    completed: str = "none",
+    incomplete: str = "dropin,config,restart",
+) -> None:
+    """Stop before a successful rollback. Does not print config text or secret values."""
+    out("running-root=" + running)
+    out("next-start-root=" + next_start)
+    out("config-names-new=" + names_new)
+    out("rollback-completed=" + completed)
+    out("rollback-incomplete=" + incomplete)
+    out("dropin-rollback=" + dropin_status)
+    out("config-rollback=" + config_status)
+    out("rollback-reason=" + reason)
+    warn("do not restart the gateway until rollback completes")
     out("rollback=incomplete")
     die("rollback incomplete; operator intervention required")
 
@@ -2497,6 +2870,12 @@ def _cmd_rollback_locked() -> int:
     value. Journal, side-file, and delegation differences are warnings.
     This command does not write or delete journal files, and it does
     not overwrite a drifted side file or delegation file.
+
+    The retirement drop-in and config.yaml are classified before either
+    is written. An unverified drop-in or a config that is not
+    stable-compatible leaves both files untouched and does not restart.
+    rollback=done is printed only after the stable gateway has restarted
+    and passed its health checks, or when that gateway was already healthy.
     """
     evidence = evidence_root()
     _recorded, user = recorded_scope(evidence)
@@ -2521,25 +2900,88 @@ def _cmd_rollback_locked() -> int:
         out("delegation-drift=changed")
     else:
         out("delegation-drift=none")
-    dropin_status = _rollback_dropin(evidence, delegation)
-    config = stored_path(evidence, "config.path")
-    config_status = _rollback_config(evidence, config, stable)
     dropin = delegation.with_name("fleet-retirement.conf")
-    if dropin_status in {"removed", "absent"}:
-        _confirm_dropin_unloaded(user)
-    incompatible = _config_names_new(config)
-    if dropin_status == "unverified" or config_status == "incomplete" or incompatible:
-        _rollback_incomplete()
-    active = shown.get("ActiveState") == "active" and shown.get("SubState") == "running"
-    root = "" if env is None else env.get("HERMES_FLEET_CONTROL_ROOT", "")
-    dropin_gone = not dropin.exists() and not dropin.is_symlink()
-    if active and root == stable and config_status == "unchanged" and dropin_status == "absent" and dropin_gone:
+    dropin_plan = _dropin_plan(evidence, delegation)
+    config = stored_path(evidence, "config.path")
+    config_status, payload = _config_plan(evidence, config, stable)
+    running = _running_root(before, env, stable)
+    next_start = _next_start_root(dropin, _desired_dropin_bytes(evidence))
+    names_new = _config_names_label(config)
+    if dropin_plan == "unverified" or config_status == "incomplete":
+        if dropin_plan == "unverified":
+            printed_dropin = "unverified"
+            printed_config = "skipped"
+            reason = "retirement drop-in is unverified"
+            incomplete = "dropin,config,restart"
+        elif dropin_plan == "removable":
+            printed_dropin = "kept"
+            printed_config = "incomplete"
+            reason = "fleet mcp config is not stable-compatible"
+            incomplete = "dropin,config,restart"
+        else:
+            printed_dropin = "absent"
+            printed_config = "incomplete"
+            reason = "fleet mcp config is not stable-compatible"
+            incomplete = "config,restart"
+        _rollback_refuse(
+            running=running,
+            next_start=next_start,
+            names_new=names_new,
+            dropin_status=printed_dropin,
+            config_status=printed_config,
+            reason=reason,
+            incomplete=incomplete,
+        )
+    if config_status in {"restored", "reversed"} and (payload is None or str(NEW).encode() in payload):
+        _rollback_refuse(
+            running=running,
+            next_start=next_start,
+            names_new=names_new,
+            dropin_status="kept" if dropin_plan == "removable" else "absent",
+            config_status="incomplete",
+            reason="fleet mcp config is not stable-compatible",
+            incomplete="dropin,config,restart" if dropin_plan == "removable" else "config,restart",
+        )
+    _apply_config(evidence, config, config_status, payload)
+    out("config-rollback=" + config_status)
+    if dropin_plan == "removable":
+        _apply_dropin_removal(evidence, delegation)
+        out("dropin-rollback=removed")
+    else:
+        out("dropin-rollback=absent")
+    if _config_names_new(config):
+        completed = "config" if config_status in {"restored", "reversed"} else "none"
+        if dropin_plan == "removable":
+            completed = completed + ",dropin" if completed != "none" else "dropin"
+        done = set() if completed == "none" else set(completed.split(","))
+        remaining = [item for item in ("dropin", "config", "restart") if item not in done]
+        _rollback_refuse(
+            running=running,
+            next_start=_next_start_root(dropin, _desired_dropin_bytes(evidence)),
+            names_new="yes",
+            dropin_status="removed" if dropin_plan == "removable" else "absent",
+            config_status=config_status,
+            reason="config.yaml still names the new checkout",
+            completed=completed,
+            incomplete=",".join(remaining),
+        )
+    reloaded = _confirm_dropin_unloaded(user)
+    if _gateway_already_stable(reloaded, stable, config_status, dropin_plan):
         out("rollback=already-stable")
         out("STEP 10 OK")
         return 0
     _restart(user, before, stable, False, check_journals=False)
     if _config_names_new(config):
-        _rollback_incomplete()
+        _rollback_refuse(
+            running="stable",
+            next_start="stable",
+            names_new="yes",
+            dropin_status="removed" if dropin_plan == "removable" else "absent",
+            config_status=config_status,
+            reason="config.yaml still names the new checkout",
+            completed="dropin,restart",
+            incomplete="config",
+        )
     out("rollback=done")
     out("STEP 10 OK")
     return 0
