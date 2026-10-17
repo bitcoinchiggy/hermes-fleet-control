@@ -324,16 +324,23 @@ names and paths may be printed. Do not print values whose keys match
   `^[A-Za-z0-9._-]+\.(js|mjs|cjs)$` with no `/` and no `..`. Flags such
   as `-e`, `--eval`, `-p`, `--print`, `--require`, `-r`, `-c`, and
   `-m` are not in that set. A fleet env value may be a benign string,
-  the stable checkout, or the same variable form. The key
-  `HERMES_FLEET_CONTROL_ROOT` is refused even when its value is the
-  stable path. A non-canonical spelling of the new checkout, another
+  the stable checkout, or the same variable form. Configure rewrites a
+  literal stable path in that env value together with the command,
+  cwd, and args. The key `HERMES_FLEET_CONTROL_ROOT` is refused even
+  when its value is the stable path. `NODE_OPTIONS`, `NODE_PATH`,
+  `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONINSPECT`,
+  `PYTHONEXECUTABLE`, `PYTHONUSERBASE`, `PYTHONSAFEPATH`,
+  `PYTHONDEVMODE`, and any key that starts with `LD_` are
+  `env-exec-override` even when the value is empty or names the
+  stable checkout. The value is not printed. `NODE_ENV` is not in
+  that set. A non-canonical spelling of the new checkout, another
   checkout anywhere in the file, a relative new-checkout cwd, or a
   variable path that contains `..` is incomplete. Unrelated keys are
   kept. An unverified retirement drop-in skips the config write and
   does not stop the unit. Without PyYAML, step 1 cannot record a
   baseline. Rollback still accepts a byte-equal baseline or a
-  byte-equal deployed config when `config.mcp-identity` matches those
-  baseline bytes. A spelling problem is still reported with its own
+  byte-equal deployed config when `config.mcp-identity` matches the
+  recorded server name and those baseline bytes. A spelling problem is still reported with its own
   detail. Any other config is incomplete with
   `rollback-detail=yaml-unavailable`. Confirm accepts that same
   byte-identical verified baseline without PyYAML and prints
@@ -368,7 +375,10 @@ delete journals to recover. An evidence directory written by an
 older helper, without a `scope` file, stops rollback with `baseline
 scope is missing`. Evidence without `mcp-server.name` or a matching
 `config.mcp-identity` stops with `fleet-server-name-missing` or an
-identity mismatch. Do not invent the server name. If
+identity mismatch. The identity line is `compatible`, the server
+name, and the sha256 of the config bytes. An older line that is only
+`compatible` plus the sha256 does not match. Changing only
+`mcp-server.name` does not satisfy that check. Do not invent the server name. If
 `fleet-retirement.conf` is absent and the gateway is still the stable
 checkout, remove that evidence directory and rerun step 1 as the same
 user. If a deploy is already in progress, do not delete the evidence
@@ -459,16 +469,23 @@ replaced. It does not mean that run wrote nothing.
   and the unit is not started. A safe plan that is not already the
   healthy stable gateway stops the unit and requires `inactive` or
   `failed`, `dead` or `failed`, `MainPID` 0, and no processes left in
-  the unit cgroup. `Restart=always`, `Restart=on-success`, an unknown
-  `Restart=` value, or an active socket, path, or timer in
-  `TriggeredBy` refuses before that stop. After a verified stop it
-  copies a verified `fleet-retirement.conf` to
+  the unit cgroup. `Restart=always` and `Restart=on-success` are
+  accepted, because `systemctl stop` does not let those policies
+  start the unit again. An unknown or empty `Restart=` value, or an
+  active socket, path, or timer in `TriggeredBy`, refuses before that
+  stop. The reason is `gateway stop not attempted`. A stop that does
+  not stay stopped, including leftover cgroup processes, is
+  `stop-unverified` with reason `gateway did not stay stopped`.
+  After a verified stop it copies a verified `fleet-retirement.conf` to
   `fleet-retirement.conf.removed` (mode `0600`) in the evidence
   directory and unlinks the drop-in, then replaces `config.yaml` from
   the baseline or with a reverse rewrite of the named fleet MCP entry,
   and chmod a baseline restore to the recorded mode. A preserved or
-  unchanged config is not written. It then runs one `daemon-reload`
-  and `systemctl start` for the same unit. It does not write the
+  unchanged config is not written. When this command stopped the
+  unit, it re-reads before that config write and again after
+  `daemon-reload`, and it starts only when the unit is still verified
+  stopped. It then runs one `daemon-reload` and `systemctl start` for
+  the same unit. It does not write the
   removed copy beside the drop-in. It does not modify journals,
   reservations, tombstones, identities, credentials, profile `.env`,
   the fleet env, the unit fragment, or `fleet-delegation.conf`. A
@@ -493,8 +510,11 @@ drop-in names, `fleet-env-name-count`, `fleet-env-names-sha256`,
 `FLEET_PROVISIONER_URL` and `FLEET_PROVISIONER_CALLER_TOKEN`. It does
 not print fleet env names or values. It also prints
 `FLEET_CONTROL_PYTHON=absent`, the journal manifest checksum,
-`stable`, `running-root`, and `baseline=created` or
-`baseline=matched`. It checks the stable HEAD and tree pins,
+`stable`, `running-root`, `restart-policy`, `triggered-by`, and
+`baseline=created` or `baseline=matched`. Preflight prints the same
+policy and triggers as `<scope>-restart-policy` and
+`<scope>-triggered-by` (`empty` or `unreadable`, and `none` or
+`unreadable`) even when the process is not live. It checks the stable HEAD and tree pins,
 `/usr/bin/python3.12` outside the agent virtualenv, root for a system
 unit, `NeedDaemonReload=no`, delegation-drop-in location, and that
 `ExecStart`, `WorkingDirectory`, and `EnvironmentFile=` do not pin the
@@ -504,8 +524,8 @@ named by `HERMES_FLEET_MCP_SERVER`. A failure prints
 `config-mcp=not-stable-compatible` and `config-mcp-detail=` and does
 not create the evidence directory. Without PyYAML that detail is
 `yaml-unavailable` and step 1 cannot record a baseline. On success it
-records `mcp-server.name` and `config.mcp-identity` (`compatible` plus
-the sha256 of the config bytes). It ends `STEP 1 OK`. It does not
+records `mcp-server.name` and `config.mcp-identity` (`compatible`,
+the server name, and the sha256 of the config bytes). It ends `STEP 1 OK`. It does not
 restart or create the new checkout. It stops if
 `fleet-retirement.conf` is already present.
 
@@ -696,9 +716,12 @@ not file text: `dropin-unverified`, `foreign-checkout`,
 `fleet-entry-missing`, `fleet-entry-malformed`,
 `fleet-server-name-missing`, `yaml-unavailable`, `yaml-unparsed`,
 `baseline-missing`, `config-unreadable`, `not-utf8`,
-`restart-policy-restarts-clean-stop`, `restart-policy-unknown`,
+`env-exec-override`, `restart-policy-unknown`,
 `activation-unit-active`, `activation-unreadable`, `stop-failed`, or
-`stop-unverified`. It then prints
+`stop-unverified`. A refusal before `systemctl stop` uses
+`rollback-reason=gateway stop not attempted`. `stop-failed` and
+`stop-unverified` use `rollback-reason=gateway did not stay stopped`.
+It then prints
 `WARNING: do not restart the gateway until rollback completes`,
 `rollback=incomplete`, and
 `STOP: rollback incomplete; operator intervention required`.
@@ -719,14 +742,16 @@ absent, `NeedDaemonReload=no`, and the config `unchanged` or
 `preserved`. That command reloads, prints `rollback=already-stable`
 and `STEP 10 OK`, and does not start. Any other safe plan checks
 activation before the stop. `Restart=no`, `on-failure`, `on-abnormal`,
-`on-watchdog`, and `on-abort` may continue. `Restart=always` and
-`Restart=on-success` would start the unit again after a clean stop, so
-the command refuses with `restart-policy-restarts-clean-stop` and
-writes nothing. Any other `Restart=` value, including empty, is
+`on-watchdog`, `on-abort`, `always`, and `on-success` may continue.
+`systemctl stop` suppresses `Restart=` for every one of those values,
+including `always` and `on-success`. A process that exits by itself
+can still be restarted by `Restart=always`; the verified stop is what
+catches that. Any other `Restart=` value, including empty, is
 `restart-policy-unknown`. A socket, path, or timer named in
 `TriggeredBy` must be `inactive` or `failed`. An active one is
 `activation-unit-active`. An unreadable one is `activation-unreadable`.
-Those refusals do not stop the unit. An already-stopped unit is not
+Those refusals do not stop the unit. The reason is
+`gateway stop not attempted`. An already-stopped unit is not
 refused for `Restart=` alone, because this command does not stop it
 again. A socket, path, or timer is still refused when it is active or
 unreadable.
@@ -734,24 +759,34 @@ unreadable.
 When the plan is safe and the unit is not already stable, the command
 runs `systemctl stop` unless the unit is already `inactive` or
 `failed` with `SubState` `dead` or `failed`, `MainPID` 0, and no
-processes in its cgroup. An already-inactive unit skips that stop and
-still starts at the end. A non-zero stop is `stop-failed`. A stop
-whose exit code is 0 is not enough: the following show must be
-`inactive` or `failed`, `dead` or `failed`, `MainPID` 0, and the unit
-cgroup must be empty. Otherwise the detail is `stop-unverified`.
-Either failure writes nothing and does not start.
+processes in its cgroup. An activating crash-loop (`auto-restart`)
+is not that state, so the command stops it. An already-inactive unit
+skips that stop and still starts at the end. A non-zero stop is
+`stop-failed`. A stop whose exit code is 0 is not enough: the
+following show must be `inactive` or `failed`, `dead` or `failed`,
+`MainPID` 0, and the unit cgroup must be empty. Otherwise the detail
+is `stop-unverified`. A failed unit that still has cgroup processes
+is `stop-unverified`, not a restart-policy refusal. Either failure
+writes nothing and does not start. The reason is
+`gateway did not stay stopped`.
 
 After a verified stop, a removable drop-in is copied to
 `fleet-retirement.conf.removed` in the evidence directory and unlinked
 (`dropin-rollback=removed`). An already-absent drop-in prints
-`dropin-rollback=absent`. A `restored` or `reversed` config is written
+`dropin-rollback=absent`. When this command issued the stop, it
+reads the unit again before the config write. If that show is not
+still verified stopped, the detail is `stop-unverified`, the config
+is not written, and the unit is not started. The drop-in may already
+be removed. A `restored` or `reversed` config is written
 after that unlink. A `preserved` or `unchanged` config is not written.
 `config-rollback=preserved` also prints a warning that the file was
 kept. If the file still names the new checkout, the command refuses
 and does not start. `daemon-reload` runs only after that config step.
 `DropInPaths` must no longer list the retirement drop-in, with
 `NeedDaemonReload=no`. A failed reload does not start. The command
-then runs `systemctl start` for the same scope and requires a new
+then runs `systemctl start` only when that post-reload show is still
+verified stopped. A unit that came back is `stop-unverified` and is
+not started. Start is for the same scope and requires a new
 `MainPID`, active/running, the stable root, delegation loaded, the
 retirement drop-in unloaded, and `FLEET_CONTROL_PYTHON` unset. The
 start waits about 10 seconds and re-reads. `NRestarts` is not required
@@ -797,9 +832,9 @@ will not rewrite `config.yaml` until the drop-in is verified or absent.
 
 If `config-names-new=yes`, or `rollback-detail` names the fleet entry,
 edit only the fleet MCP entry named by `mcp-server.name` so its
-command, cwd, and args name the stable checkout or
+command, cwd, args, and env values name the stable checkout or
 `${HERMES_FLEET_CONTROL_ROOT}`, and remove a fleet env checkout
-reference or `HERMES_FLEET_CONTROL_ROOT` override. An env value that is
+reference, an execution override, or `HERMES_FLEET_CONTROL_ROOT` override. An env value that is
 the stable checkout or `${HERMES_FLEET_CONTROL_ROOT}` plus a relative
 child may stay. Leave unrelated keys and unrelated MCP servers in
 place. Re-run rollback. Use `rollback-detail` to see which check
@@ -825,7 +860,8 @@ and is not modified. A successful confirm prints
 `config-mcp=stable-compatible` and then `STEP 11 OK`. That MCP line is
 either `config-mcp-detail=verified-baseline`, when the live bytes are
 exactly the evidence `config.yaml`, `config.mcp-identity` is
-`compatible` plus the sha256 of those bytes, and the bytes do not name
+`compatible`, the recorded server name, and the sha256 of those
+bytes, and the bytes do not name
 the new checkout, or it is the full `fleet_mcp_compatibility` pass for
 the recorded server name with no `verified-baseline` line. A modified
 file cannot use the baseline exception. A missing, renamed, or

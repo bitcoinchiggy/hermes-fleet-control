@@ -90,7 +90,27 @@ SHOW_PROPS = (
     "TriggeredBy",
     "ControlGroup",
 )
-SAFE_STOP_RESTART = frozenset({"no", "on-failure", "on-abnormal", "on-watchdog", "on-abort"})
+# systemctl stop suppresses Restart=, including always and on-success.
+# An empty or unrecognized value stays fail-closed.
+SAFE_STOP_RESTART = frozenset(
+    {"no", "on-failure", "on-abnormal", "on-watchdog", "on-abort", "always", "on-success"}
+)
+EXEC_ENV_KEYS = frozenset(
+    {
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONEXECUTABLE",
+        "PYTHONUSERBASE",
+        "PYTHONSAFEPATH",
+        "PYTHONDEVMODE",
+    }
+)
+_POLICY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+_UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9:@._-]+$")
 SECRET_KEY_RE = re.compile(
     r"(TOKEN|SECRET|PASSWORD|PRIVATE|NSEC|CREDENTIAL|KEY)$|^(AUTHORIZATION)$",
     re.IGNORECASE,
@@ -482,6 +502,11 @@ def _mcp_strings(data: dict, server_name: str) -> dict[str, str]:
         for index, item in enumerate(args):
             if isinstance(item, str):
                 found[f"args[{index}]"] = item
+    env = server.get("env")
+    if isinstance(env, dict):
+        for key, value in env.items():
+            if isinstance(key, str) and isinstance(value, str):
+                found["env." + key] = value
     return found
 
 
@@ -499,7 +524,7 @@ def rewrite_config(text: str, stable: str, new: str, server_name: str) -> tuple[
     before = _mcp_strings(_load_yaml(text), server_name)
     swaps = sum(1 for value in before.values() if stable in value)
     if text.count(stable) != swaps:
-        die("stable path appears outside the fleet mcp command, cwd, or args")
+        die("stable path appears outside the fleet mcp command, cwd, args, or env")
     updated = text.replace(stable, new)
     if stable in updated:
         die("stable path remains after replacement")
@@ -515,7 +540,7 @@ def rewrite_config(text: str, stable: str, new: str, server_name: str) -> tuple[
     before_rest = _without_mcp(text, server_name)
     after_rest = _without_mcp(updated, server_name)
     if before_rest != after_rest:
-        die("yaml change is not only the fleet mcp command, cwd, or args")
+        die("yaml change is not only the fleet mcp command, cwd, args, or env")
     return updated, "rewritten"
 
 
@@ -1270,6 +1295,29 @@ def cmd_preflight() -> int:
     return preflight_exit(blockers)
 
 
+def _exec_env_override(key: str) -> bool:
+    """True for a Node, Python, or dynamic-linker setting that changes execution."""
+    return key in EXEC_ENV_KEYS or key.startswith("LD_")
+
+
+def _restart_policy_label(value: str) -> str:
+    if value == "":
+        return "empty"
+    if _POLICY_RE.fullmatch(value):
+        return value
+    return "unreadable"
+
+
+def _triggered_by_label(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return "none"
+    names = text.split()
+    if all(_UNIT_NAME_RE.fullmatch(name) for name in names):
+        return ",".join(names)
+    return "unreadable"
+
+
 def _report_gateway(scope: str, user: bool, facts: dict[str, str]) -> None:
     shown = systemctl_show(user)
     if shown is None:
@@ -1285,6 +1333,8 @@ def _report_gateway(scope: str, user: bool, facts: dict[str, str]) -> None:
     out(f"{scope}-fragment=" + (safe_path(fragment) if fragment.startswith("/") else "redacted"))
     names = dropin_names(shown)
     out(f"{scope}-dropins=" + (",".join(names) if names else "none"))
+    out(f"{scope}-restart-policy=" + _restart_policy_label(shown.get("Restart", "")))
+    out(f"{scope}-triggered-by=" + _triggered_by_label(shown.get("TriggeredBy", "")))
     try:
         pid = int(shown["MainPID"])
     except ValueError:
@@ -2184,7 +2234,7 @@ def _cmd_baseline_locked() -> int:
         "fleet-delegation.conf": delegation.read_bytes(),
         "config.yaml": config_bytes,
         "mcp-server.name": (server_name + "\n").encode(),
-        "config.mcp-identity": ("compatible " + hashlib.sha256(config_bytes).hexdigest() + "\n").encode(),
+        "config.mcp-identity": (_mcp_identity_line(server_name, config_bytes) + "\n").encode(),
         "config.mode": str(stat.S_IMODE(config.stat().st_mode)).encode(),
         "fleet.env": fleet_env.read_bytes(),
         "profile.env": profile_env.read_bytes(),
@@ -2203,6 +2253,8 @@ def _cmd_baseline_locked() -> int:
     out(f"ActiveState={shown['ActiveState']}")
     out(f"SubState={shown['SubState']}")
     out(f"MainPID={pid}")
+    out("restart-policy=" + _restart_policy_label(shown.get("Restart", "")))
+    out("triggered-by=" + _triggered_by_label(shown.get("TriggeredBy", "")))
     out("NRestarts=" + shown["NRestarts"])
     out("nrestarts-measures=" + NRESTARTS_MEASURES)
     out("dropins=" + ",".join(names))
@@ -2640,6 +2692,8 @@ def _validate_fleet_server(server: dict, stable_dir: str) -> str:
             return "fleet-entry-malformed"
         if key == "HERMES_FLEET_CONTROL_ROOT":
             return "env-overrides-root"
+        if _exec_env_override(key):
+            return "env-exec-override"
         kind = _checkout_kind(value, stable_dir)
         if kind is None:
             continue
@@ -2656,7 +2710,8 @@ def fleet_mcp_compatibility(text: str, stable_dir: str, server_name: str) -> str
     not a secret. The fleet entry is the server named by server_name.
     Another server is not selected because it mentions the stable checkout.
     Unrelated servers may mention stable paths. The named entry is strict.
-    A non-string field on that entry is malformed. The whole text is still
+    A non-string field on that entry is malformed. An execution-changing
+    env key is env-exec-override and its value is not printed. The whole text is still
     rejected when it names the new checkout or another checkout. Paths are
     normalized without resolving symlinks.
     """
@@ -2706,10 +2761,19 @@ def _recorded_server_name(evidence: Path) -> str | None:
     return text
 
 
+def _mcp_identity_line(server_name: str, config_bytes: bytes) -> str:
+    """Identity bound to the recorded server name and the config bytes.
+
+    An older line of ``compatible`` plus only the sha256 does not match.
+    """
+    return "compatible " + server_name + " " + hashlib.sha256(config_bytes).hexdigest()
+
+
 def _baseline_identity_matches(evidence: Path, config_bytes: bytes) -> bool:
     """True when config bytes are the baseline step 1 marked compatible."""
     path = evidence / "config.mcp-identity"
-    if _recorded_server_name(evidence) is None:
+    server_name = _recorded_server_name(evidence)
+    if server_name is None:
         return False
     try:
         info = os.lstat(path)
@@ -2721,8 +2785,7 @@ def _baseline_identity_matches(evidence: Path, config_bytes: bytes) -> bool:
         recorded = path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
         return False
-    digest = hashlib.sha256(config_bytes).hexdigest()
-    return recorded == "compatible " + digest
+    return recorded == _mcp_identity_line(server_name, config_bytes)
 
 
 def _config_plan(evidence: Path, config: Path, stable_dir: str) -> tuple[str, bytes | None, str]:
@@ -3017,17 +3080,16 @@ def _activation_problem(
     *,
     require_stop_policy: bool = True,
 ) -> str | None:
-    """A clean stop would not stick, or a trigger could start the unit again.
+    """Refuse an unknown Restart= or a trigger that could start the unit.
 
-    Restart= is checked only when this command will run systemctl stop.
-    An already-stopped unit is not started by that policy. A socket, path,
-    or timer can still activate it, so those are always checked.
+    systemctl stop suppresses Restart=, including always and on-success,
+    so those policies are accepted. An empty or unrecognized Restart= is
+    refused before the stop. An already-stopped unit is not refused for
+    Restart= alone. A socket, path, or timer is always checked.
     """
     if require_stop_policy:
         policy = shown.get("Restart", "")
         if policy not in SAFE_STOP_RESTART:
-            if policy in {"always", "on-success"}:
-                return "restart-policy-restarts-clean-stop"
             return "restart-policy-unknown"
     for unit in shown.get("TriggeredBy", "").split():
         if not unit.endswith((".socket", ".path", ".timer")):
@@ -3087,25 +3149,30 @@ def _cgroup_clear(shown: dict[str, str]) -> bool:
     return _unit_cgroup_pids(shown.get("ControlGroup", "")) == []
 
 
-def _ensure_stopped(user: bool, shown: dict[str, str]) -> tuple[dict[str, str] | None, str]:
+def _stop_held(shown: dict[str, str] | None) -> bool:
+    return shown is not None and _stopped_state(shown) and _cgroup_clear(shown)
+
+
+def _ensure_stopped(user: bool, shown: dict[str, str]) -> tuple[dict[str, str] | None, str, bool]:
     """Stop the unit and require a verified stop. Does not start it.
 
-    The returned detail is empty when the unit is verified stopped.
-    A refusal detail means the caller must not write files and must not start.
+    The detail is empty when the unit is verified stopped. The bool is
+    true when this call ran systemctl stop. A refusal detail means the
+    caller must not write files and must not start.
     """
-    already = _stopped_state(shown) and _cgroup_clear(shown)
+    already = _stop_held(shown)
     problem = _activation_problem(user, shown, require_stop_policy=not already)
     if problem is not None:
-        return None, problem
+        return None, problem, False
     if already:
-        return shown, ""
+        return shown, "", False
     argv = ["systemctl", "--user", "stop", UNIT] if user else ["systemctl", "stop", UNIT]
     if _run(argv)[0] != 0:
-        return None, "stop-failed"
+        return None, "stop-failed", True
     after = systemctl_show(user)
-    if after is None or not _stopped_state(after) or not _cgroup_clear(after):
-        return None, "stop-unverified"
-    return after, ""
+    if not _stop_held(after):
+        return None, "stop-unverified", True
+    return after, "", True
 
 
 def _start_stopped(
@@ -3165,7 +3232,11 @@ def _cmd_rollback_locked() -> int:
     unit, and does not start it. A plan that must replace a running
     gateway stops it and verifies the stop before the first write.
     The writes are unlink, then config.yaml, then daemon-reload, then
-    start. A failure after the stop leaves the unit stopped.
+    start. Restart=always and Restart=on-success are accepted because
+    systemctl stop suppresses them. The stop is verified, checked
+    again before the config write when this command stopped the unit,
+    and checked again on the post-reload show before start. A failure
+    after the stop leaves the unit stopped and does not start it.
     rollback=done is printed only after that start passes its health
     checks. An already-healthy stable gateway is not stopped.
     """
@@ -3248,20 +3319,40 @@ def _cmd_rollback_locked() -> int:
         out("rollback=already-stable")
         out("STEP 10 OK")
         return 0
-    stopped, stop_detail = _ensure_stopped(user, shown)
+    stopped, stop_detail, issued_stop = _ensure_stopped(user, shown)
     if stopped is None:
+        attempted = stop_detail in {"stop-failed", "stop-unverified"}
         _rollback_refuse(
             running=running,
             next_start=next_start,
             names_new=names_new,
             dropin_status="kept" if dropin_plan == "removable" else "absent",
             config_status="skipped",
-            reason="gateway did not stay stopped",
+            reason="gateway did not stay stopped" if attempted else "gateway stop not attempted",
             detail=stop_detail,
             incomplete="dropin,config,restart" if dropin_plan == "removable" else "config,restart",
         )
     if dropin_plan == "removable":
         _apply_dropin_removal(evidence, delegation)
+    if issued_stop:
+        again = systemctl_show(user)
+        if not _stop_held(again):
+            completed = "dropin" if dropin_plan == "removable" else "none"
+            remaining = ["restart"]
+            if config_status in {"restored", "reversed"}:
+                remaining.insert(0, "config")
+            _rollback_refuse(
+                running=running,
+                next_start=_next_start_root(dropin, _desired_dropin_bytes(evidence)),
+                names_new=names_new,
+                dropin_status="removed" if dropin_plan == "removable" else "absent",
+                config_status="skipped",
+                reason="gateway did not stay stopped",
+                detail="stop-unverified",
+                completed=completed,
+                incomplete=",".join(remaining),
+            )
+    if dropin_plan == "removable":
         out("dropin-rollback=removed")
     else:
         out("dropin-rollback=absent")
@@ -3294,6 +3385,18 @@ def _cmd_rollback_locked() -> int:
             config_status=config_status,
             reason="config.yaml still names the new checkout",
             detail="foreign-checkout",
+            completed="dropin,config",
+            incomplete="restart",
+        )
+    if not _stop_held(reloaded):
+        _rollback_refuse(
+            running="none",
+            next_start="stable",
+            names_new="no",
+            dropin_status="removed" if dropin_plan == "removable" else "absent",
+            config_status=config_status,
+            reason="gateway did not stay stopped",
+            detail="stop-unverified",
             completed="dropin,config",
             incomplete="restart",
         )

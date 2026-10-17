@@ -26,6 +26,33 @@ from fleet_control.retire import RETIRE_JOURNAL_DIR
 from fleet_control.retire import _resolve_dir as retire_resolve
 from fleet_control.support.profile_env import HERMES_PROFILES_DIR
 
+_NAMESPACE_REASON: str | None = None
+
+
+def _user_mount_namespace_reason() -> str:
+    """Empty when user and mount namespaces work. Otherwise the skip reason."""
+    global _NAMESPACE_REASON
+    if _NAMESPACE_REASON is not None:
+        return _NAMESPACE_REASON
+    try:
+        completed = subprocess.run(
+            ["unshare", "--user", "--mount", "--map-root-user", "true"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        _NAMESPACE_REASON = "user and mount namespaces are unavailable: unshare could not be run (" + str(exc.strerror or exc) + ")"
+        return _NAMESPACE_REASON
+    if completed.returncode == 0:
+        _NAMESPACE_REASON = ""
+        return ""
+    detail = (completed.stderr or completed.stdout or "unshare failed").strip().splitlines()
+    line = detail[-1] if detail else "unshare failed"
+    _NAMESPACE_REASON = "user and mount namespaces are unavailable: " + line[:240]
+    return _NAMESPACE_REASON
+
+
 _SPEC = importlib.util.spec_from_file_location(
     "c08cb1e_material",
     ROOT / "docs" / "deploy" / "c08cb1e_material.py",
@@ -311,6 +338,7 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertIn("STOP:", refused.stderr)
 
     def test_guest_node_witness_names_its_host_writes(self):
+        self._require_user_mount_namespace()
         witness = ROOT / "docs" / "deploy" / "c08cb1e-guest-node-witness.sh"
         stub = Path(tempfile.mkdtemp())
         (stub / "qm").write_text(
@@ -771,7 +799,7 @@ class DeployMaterialTests(unittest.TestCase):
             "fleet-delegation.conf": delegation.read_bytes(),
             "config.yaml": baseline,
             "mcp-server.name": b"fleet\n",
-            "config.mcp-identity": ("compatible " + hashlib.sha256(baseline).hexdigest() + "\n").encode(),
+            "config.mcp-identity": self._identity(baseline).encode(),
             "config.mode": b"416",
             "config.yaml.deployed": b"deployed-config\n",
             "fleet-retirement.conf.desired": b"retirement-v1\n",
@@ -799,10 +827,7 @@ class DeployMaterialTests(unittest.TestCase):
             baseline = self._fleet_text(stable, command="node")
             config.write_text(baseline, encoding="utf-8")
             (evidence / "config.yaml").write_bytes(baseline.encode())
-            (evidence / "config.mcp-identity").write_text(
-                "compatible " + hashlib.sha256(baseline.encode()).hexdigest() + "\n",
-                encoding="utf-8",
-            )
+            (evidence / "config.mcp-identity").write_text(self._identity(baseline.encode()), encoding="utf-8")
             (evidence / "config.yaml.deployed").unlink()
             (evidence / "fleet-retirement.conf.desired").unlink()
             delegation = live / "fleet-delegation.conf"
@@ -1137,7 +1162,7 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertTrue(any("daemon-reload" in item for item in flat))
             self.assertFalse(any(item.endswith("start " + material.UNIT) or item.endswith("stop " + material.UNIT) or item.endswith("restart " + material.UNIT) for item in flat))
 
-    def test_guest_node_witness_rejects_args_and_symlinks(self):
+    def test_guest_node_witness_rejects_extra_args(self):
         witness = ROOT / "docs" / "deploy" / "c08cb1e-guest-node-witness.sh"
         refused = subprocess.run(
             ["bash", str(witness), "extra"],
@@ -1147,6 +1172,10 @@ class DeployMaterialTests(unittest.TestCase):
         )
         self.assertEqual(refused.returncode, 2)
         self.assertIn("STOP:", refused.stderr)
+
+    def test_guest_node_witness_rejects_symlinks(self):
+        self._require_user_mount_namespace()
+        witness = ROOT / "docs" / "deploy" / "c08cb1e-guest-node-witness.sh"
         stub = Path(tempfile.mkdtemp())
         (stub / "qm").write_text("#!/bin/sh\necho 'VMID NAME STATUS'\necho '101 alpha running'\n", encoding="utf-8")
         (stub / "systemctl").write_text("#!/bin/sh\necho not-found\nexit 0\n", encoding="utf-8")
@@ -1550,12 +1579,23 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertIn(code, (0, 4))
             self.assertIn("user-unit=loaded", text)
             self.assertIn("system-unit=not-loaded", text)
+            self.assertIn("user-restart-policy=no", text)
+            self.assertIn("user-triggered-by=none", text)
             self.assertTrue("user-mcp-command=public:node" in text or "user-mcp-config=unparsed" in text)
             self.assertIn("user-journals=private-nonempty", text)
             self.assertNotIn("env-body-secret", text)
             self.assertNotIn("journal-body-secret", text)
             self.assertTrue(any(argv[0] == "systemctl" and "--user" in argv for argv in seen))
             self.assertFalse(any(argv[0] == "systemctl" and argv[1:3] == ["start", material.UNIT] for argv in seen))
+
+    def _require_user_mount_namespace(self) -> None:
+        reason = _user_mount_namespace_reason()
+        if reason:
+            sys.stderr.write("SKIP: " + self._testMethodName + ": " + reason + "\n")
+            self.skipTest(reason)
+
+    def _identity(self, payload: bytes, server_name: str = "fleet") -> str:
+        return "compatible " + server_name + " " + hashlib.sha256(payload).hexdigest() + "\n"
 
     def _require_yaml(self) -> None:
         try:
@@ -1868,6 +1908,7 @@ class DeployMaterialTests(unittest.TestCase):
                         os.chmod(evidence.parent, 0o700)
 
     def test_guest_node_witness_reports_a_held_lock(self):
+        self._require_user_mount_namespace()
         witness = ROOT / "docs" / "deploy" / "c08cb1e-guest-node-witness.sh"
         stub = Path(tempfile.mkdtemp())
         (stub / "qm").write_text("#!/bin/sh\necho 'VMID NAME STATUS'\necho '101 alpha running'\n", encoding="utf-8")
@@ -2490,10 +2531,7 @@ class DeployMaterialTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             evidence, live_dir, _journal = self._evidence(Path(tmp))
             (evidence / "config.yaml").write_bytes(base.encode())
-            (evidence / "config.mcp-identity").write_text(
-                "compatible " + hashlib.sha256(base.encode()).hexdigest() + "\n",
-                encoding="utf-8",
-            )
+            (evidence / "config.mcp-identity").write_text(self._identity(base.encode()), encoding="utf-8")
             config = live_dir / "config.yaml"
             config.write_text(live, encoding="utf-8")
             dropin = live_dir / "fleet-retirement.conf"
@@ -2510,10 +2548,7 @@ class DeployMaterialTests(unittest.TestCase):
             root = Path(tmp)
             evidence, live_dir, _journal = self._evidence(root)
             (evidence / "config.yaml").write_bytes(base.encode())
-            (evidence / "config.mcp-identity").write_text(
-                "compatible " + hashlib.sha256(base.encode()).hexdigest() + "\n",
-                encoding="utf-8",
-            )
+            (evidence / "config.mcp-identity").write_text(self._identity(base.encode()), encoding="utf-8")
             config = live_dir / "config.yaml"
             config.write_text(base, encoding="utf-8")
             delegation = live_dir / "fleet-delegation.conf"
@@ -2649,7 +2684,9 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertIn("STEP 1 OK", stdout.getvalue())
             self.assertEqual((evidence / "mcp-server.name").read_text(encoding="utf-8"), "fleet\n")
             identity = (evidence / "config.mcp-identity").read_text(encoding="utf-8").strip()
-            self.assertEqual(identity, "compatible " + hashlib.sha256(good.encode()).hexdigest())
+            self.assertEqual(identity, "compatible fleet " + hashlib.sha256(good.encode()).hexdigest())
+            self.assertIn("restart-policy=no", stdout.getvalue())
+            self.assertIn("triggered-by=none", stdout.getvalue())
             self.assertEqual((evidence / "config.yaml").read_text(encoding="utf-8"), good)
 
     def _active_rollback(
@@ -2731,7 +2768,7 @@ class DeployMaterialTests(unittest.TestCase):
                 DropInPaths=str(delegation),
             )
             started = self._show(MainPID="88", NRestarts="0", Restart="no", DropInPaths=str(delegation))
-            shows = [dict(active), dict(stopped), dict(stopped), dict(started), dict(started)]
+            shows = [dict(active), dict(stopped), dict(stopped), dict(stopped), dict(started), dict(started)]
             code, text, err, commands = self._active_rollback(evidence, live_dir, shows=shows)
             self.assertEqual(code, 0, text + err)
             self.assertIn("rollback=done", text)
@@ -2754,8 +2791,6 @@ class DeployMaterialTests(unittest.TestCase):
                 None,
                 "cwd-not-anchored",
             ),
-            "restart-always": (kept, "always", "", None, "restart-policy-restarts-clean-stop"),
-            "restart-on-success": (kept, "on-success", "", None, "restart-policy-restarts-clean-stop"),
             "restart-unknown": (kept, "", "", None, "restart-policy-unknown"),
             "socket-active": (kept, "no", "hermes-gateway-control.socket", "active", "activation-unit-active"),
             "socket-unreadable": (kept, "no", "hermes-gateway-control.socket", None, "activation-unreadable"),
@@ -2789,6 +2824,11 @@ class DeployMaterialTests(unittest.TestCase):
                     )
                     self.assertEqual(code, 1, text + err)
                     self.assertIn("rollback-detail=" + detail, text)
+                    if label == "plan-before-stop":
+                        self.assertIn("rollback-reason=fleet mcp config is not stable-compatible", text)
+                    else:
+                        self.assertIn("rollback-reason=gateway stop not attempted", text)
+                    self.assertNotIn("gateway did not stay stopped", text)
                     self._assert_not_success(text)
                     self.assertEqual(config.read_bytes(), before)
                     self.assertEqual(dropin.read_bytes(), b"retirement-v1\n")
@@ -2797,6 +2837,9 @@ class DeployMaterialTests(unittest.TestCase):
                     self.assertFalse(any(item.endswith("start " + material.UNIT) for item in flat))
                     self.assertFalse(any("daemon-reload" in item for item in flat))
         self.assertIsNone(material._activation_problem(True, self._show(Restart="on-failure")))
+        self.assertIsNone(material._activation_problem(True, self._show(Restart="always")))
+        self.assertIsNone(material._activation_problem(True, self._show(Restart="on-success")))
+        self.assertEqual(material._activation_problem(True, self._show(Restart="")), "restart-policy-unknown")
         with unittest.mock.patch.object(material, "_run", lambda argv, cwd=None: (0, "ActiveState=inactive\n")):
             self.assertIsNone(
                 material._activation_problem(True, self._show(Restart="no", TriggeredBy="hermes-gateway-control.socket"))
@@ -2833,6 +2876,7 @@ class DeployMaterialTests(unittest.TestCase):
             )
             self.assertEqual(code, 1, text + err)
             self.assertIn("rollback-detail=stop-failed", text)
+            self.assertIn("rollback-reason=gateway did not stay stopped", text)
             self._assert_not_success(text)
             self.assertEqual(config.read_bytes(), before)
             self.assertEqual(dropin.read_bytes(), b"retirement-v1\n")
@@ -2855,6 +2899,7 @@ class DeployMaterialTests(unittest.TestCase):
             )
             self.assertEqual(code, 1, text + err)
             self.assertIn("rollback-detail=stop-unverified", text)
+            self.assertIn("rollback-reason=gateway did not stay stopped", text)
             self._assert_not_success(text)
             self.assertEqual(config.read_bytes(), before)
             self.assertTrue(dropin.exists())
@@ -2883,6 +2928,7 @@ class DeployMaterialTests(unittest.TestCase):
             )
             self.assertEqual(code, 1, text + err)
             self.assertIn("rollback-detail=stop-unverified", text)
+            self.assertIn("rollback-reason=gateway did not stay stopped", text)
             self._assert_not_success(text)
             self.assertEqual(config.read_bytes(), before)
             self.assertTrue(dropin.exists())
@@ -2941,7 +2987,7 @@ class DeployMaterialTests(unittest.TestCase):
                 material.die("config write failed")
 
             code, text, err, commands = self._active_rollback(
-                evidence, live_dir, shows=[dict(active), dict(stopped)], apply=fail_write
+                evidence, live_dir, shows=[dict(active), dict(stopped), dict(stopped)], apply=fail_write
             )
             self.assertEqual(code, 1, text + err)
             self.assertIn("config write failed", err)
@@ -3055,6 +3101,403 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertEqual(code, 0, text + err)
             self.assertIn("rollback=done", text)
             self.assertIn("config-rollback=preserved", text)
+
+    def test_restart_always_rolls_back_and_verifies_the_stable_gateway(self):
+        self._require_yaml()
+        stable = "/opt/hermes-fleet-control/stable"
+        new = str(material.NEW)
+        deployed = self._fleet_text(new)
+        drifted = deployed + "extra: operator\n"
+        for policy in ("always", "on-success"):
+            with self.subTest(policy=policy, state="active"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    evidence, live_dir, _journal = self._evidence(Path(tmp))
+                    (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+                    config = live_dir / "config.yaml"
+                    config.write_text(drifted, encoding="utf-8")
+                    delegation = live_dir / "fleet-delegation.conf"
+                    dropin = live_dir / "fleet-retirement.conf"
+                    dropin.write_bytes(b"retirement-v1\n")
+                    active = self._show(
+                        MainPID="77", Restart=policy, DropInPaths=str(delegation) + " " + str(dropin)
+                    )
+                    stopped = self._show(
+                        ActiveState="inactive",
+                        SubState="dead",
+                        MainPID="0",
+                        Restart=policy,
+                        DropInPaths=str(delegation),
+                    )
+                    started = self._show(MainPID="88", NRestarts="0", Restart=policy, DropInPaths=str(delegation))
+                    shows = [
+                        dict(active),
+                        dict(stopped),
+                        dict(stopped),
+                        dict(stopped),
+                        dict(started),
+                        dict(started),
+                    ]
+                    code, text, err, commands = self._active_rollback(evidence, live_dir, shows=shows)
+                    self.assertEqual(code, 0, text + err)
+                    self.assertIn("rollback=done", text)
+                    self.assertNotIn(new, config.read_text(encoding="utf-8"))
+                    self.assertIn(stable, config.read_text(encoding="utf-8"))
+                    self.assertFalse(dropin.exists())
+                    flat = [" ".join(argv) for argv in commands]
+                    self.assertTrue(any(item.endswith("stop " + material.UNIT) for item in flat))
+                    self.assertTrue(any(item.endswith("start " + material.UNIT) for item in flat))
+                    self.assertFalse(any(item.endswith("restart " + material.UNIT) for item in flat))
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            config = live_dir / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            delegation = live_dir / "fleet-delegation.conf"
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            looping = self._show(
+                ActiveState="activating",
+                SubState="auto-restart",
+                MainPID="0",
+                Restart="always",
+                DropInPaths=str(delegation) + " " + str(dropin),
+            )
+            stopped = self._show(
+                ActiveState="inactive",
+                SubState="dead",
+                MainPID="0",
+                Restart="always",
+                DropInPaths=str(delegation),
+            )
+            started = self._show(MainPID="88", NRestarts="1", Restart="always", DropInPaths=str(delegation))
+            code, text, err, commands = self._active_rollback(
+                evidence,
+                live_dir,
+                shows=[dict(looping), dict(stopped), dict(stopped), dict(stopped), dict(started), dict(started)],
+            )
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("rollback=done", text)
+            self.assertIn(stable, config.read_text(encoding="utf-8"))
+            self.assertFalse(dropin.exists())
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any(item.endswith("stop " + material.UNIT) for item in flat))
+            self.assertTrue(any(item.endswith("start " + material.UNIT) for item in flat))
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            config = live_dir / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            before = config.read_bytes()
+            delegation = live_dir / "fleet-delegation.conf"
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            looping = self._show(
+                ActiveState="activating",
+                SubState="auto-restart",
+                MainPID="0",
+                Restart="always",
+                DropInPaths=str(delegation) + " " + str(dropin),
+            )
+            code, text, err, commands = self._active_rollback(
+                evidence, live_dir, shows=[dict(looping), dict(looping)]
+            )
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("rollback-detail=stop-unverified", text)
+            self.assertIn("rollback-reason=gateway did not stay stopped", text)
+            self._assert_not_success(text)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual(dropin.read_bytes(), b"retirement-v1\n")
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any(item.endswith("stop " + material.UNIT) for item in flat))
+            self.assertFalse(any(item.endswith("start " + material.UNIT) for item in flat))
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            config = live_dir / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            before = config.read_bytes()
+            delegation = live_dir / "fleet-delegation.conf"
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            failed = self._show(
+                ActiveState="failed",
+                SubState="failed",
+                MainPID="0",
+                Restart="always",
+                DropInPaths=str(delegation) + " " + str(dropin),
+            )
+            code, text, err, commands = self._active_rollback(
+                evidence, live_dir, shows=[dict(failed), dict(failed)], cgroup=[55]
+            )
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("rollback-detail=stop-unverified", text)
+            self.assertIn("rollback-reason=gateway did not stay stopped", text)
+            self.assertNotIn("restart-policy", text)
+            self._assert_not_success(text)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertTrue(dropin.exists())
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any(item.endswith("stop " + material.UNIT) for item in flat))
+            self.assertFalse(any(item.endswith("start " + material.UNIT) for item in flat))
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            config = live_dir / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            before = config.read_bytes()
+            delegation = live_dir / "fleet-delegation.conf"
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            active = self._show(MainPID="77", Restart="always", DropInPaths=str(delegation) + " " + str(dropin))
+            stopped = self._show(
+                ActiveState="inactive", SubState="dead", MainPID="0", Restart="always", DropInPaths=str(delegation)
+            )
+            returned = self._show(MainPID="77", Restart="always", DropInPaths=str(delegation) + " " + str(dropin))
+            code, text, err, commands = self._active_rollback(
+                evidence, live_dir, shows=[dict(active), dict(stopped), dict(returned)]
+            )
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("rollback-detail=stop-unverified", text)
+            self.assertIn("rollback-reason=gateway did not stay stopped", text)
+            self.assertIn("rollback-completed=dropin", text)
+            self._assert_not_success(text)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertFalse(dropin.exists())
+            flat = [" ".join(argv) for argv in commands]
+            self.assertFalse(any("daemon-reload" in item or item.endswith("start " + material.UNIT) for item in flat))
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            config = live_dir / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            delegation = live_dir / "fleet-delegation.conf"
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            active = self._show(MainPID="77", Restart="always", DropInPaths=str(delegation) + " " + str(dropin))
+            stopped = self._show(
+                ActiveState="inactive", SubState="dead", MainPID="0", Restart="always", DropInPaths=str(delegation)
+            )
+            returned = self._show(MainPID="90", Restart="always", DropInPaths=str(delegation))
+            code, text, err, commands = self._active_rollback(
+                evidence, live_dir, shows=[dict(active), dict(stopped), dict(stopped), dict(returned)]
+            )
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("rollback-detail=stop-unverified", text)
+            self.assertIn("rollback-reason=gateway did not stay stopped", text)
+            self.assertIn("rollback-incomplete=restart", text)
+            self._assert_not_success(text)
+            self.assertNotIn(new, config.read_text(encoding="utf-8"))
+            self.assertIn(stable, config.read_text(encoding="utf-8"))
+            self.assertFalse(dropin.exists())
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any("daemon-reload" in item for item in flat))
+            self.assertFalse(any(item.endswith("start " + material.UNIT) for item in flat))
+
+    def test_namespace_probe_names_the_reason_when_unshare_fails(self):
+        global _NAMESPACE_REASON
+        previous = _NAMESPACE_REASON
+        _NAMESPACE_REASON = None
+
+        def fake_run(argv, **_kwargs):
+            self.assertEqual(argv[:4], ["unshare", "--user", "--mount", "--map-root-user"])
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "",
+                "unshare: write failed /proc/self/uid_map: Operation not permitted\n",
+            )
+
+        try:
+            with unittest.mock.patch("tests.test_c08cb1e_deploy_material.subprocess.run", fake_run):
+                reason = _user_mount_namespace_reason()
+            self.assertIn("user and mount namespaces are unavailable", reason)
+            self.assertIn("Operation not permitted", reason)
+            self.assertEqual(_user_mount_namespace_reason(), reason)
+            with self.assertRaises(unittest.SkipTest) as caught:
+                self._require_user_mount_namespace()
+            self.assertIn("Operation not permitted", str(caught.exception))
+        finally:
+            _NAMESPACE_REASON = previous
+
+    def test_literal_stable_env_is_compatible_and_rewritten(self):
+        self._require_yaml()
+        stable = "/opt/hermes-fleet-control/stable"
+        new = str(material.NEW)
+        text = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            "    command: node\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {stable}/fleet-mcp\n"
+            "    env:\n"
+            f"      FLEET_PY: {stable}/runtime/venv/bin/python\n"
+            "      LOG_LEVEL: info\n"
+        )
+        self.assertEqual(material.fleet_mcp_compatibility(text, stable, "fleet"), "compatible")
+        updated, status = material.rewrite_config(text, stable, new, "fleet")
+        self.assertEqual(status, "rewritten")
+        self.assertNotIn(stable, updated)
+        self.assertIn(new + "/runtime/venv/bin/python", updated)
+        self.assertIn(new + "/fleet-mcp", updated)
+        self.assertIn("LOG_LEVEL: info", updated)
+        interpolated = text.replace(stable, "${HERMES_FLEET_CONTROL_ROOT}")
+        again, kept = material.rewrite_config(interpolated, stable, new, "fleet")
+        self.assertEqual(kept, "interpolated")
+        self.assertIn("${HERMES_FLEET_CONTROL_ROOT}", again)
+
+    def test_exec_env_cannot_bypass_command_limits(self):
+        self._require_yaml()
+        stable = "/opt/hermes-fleet-control/stable"
+        sentinel = "SENTINEL-EXEC-VALUE"
+        keys = (
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHONINSPECT",
+            "PYTHONEXECUTABLE",
+            "PYTHONUSERBASE",
+            "PYTHONSAFEPATH",
+            "PYTHONDEVMODE",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+        )
+        for key in keys:
+            with self.subTest(key=key):
+                text = (
+                    "mcp_servers:\n"
+                    "  fleet:\n"
+                    "    command: node\n"
+                    "    args:\n"
+                    "      - index.js\n"
+                    f"    cwd: {stable}/fleet-mcp\n"
+                    "    env:\n"
+                    f"      {key}: {sentinel}\n"
+                )
+                self.assertEqual(material.fleet_mcp_compatibility(text, stable, "fleet"), "env-exec-override")
+        empty = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            "    command: node\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {stable}/fleet-mcp\n"
+            "    env:\n"
+            "      NODE_OPTIONS: ''\n"
+        )
+        self.assertEqual(material.fleet_mcp_compatibility(empty, stable, "fleet"), "env-exec-override")
+        anchored = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            "    command: node\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {stable}/fleet-mcp\n"
+            "    env:\n"
+            f"      NODE_OPTIONS: {stable}/fleet-mcp\n"
+        )
+        self.assertEqual(material.fleet_mcp_compatibility(anchored, stable, "fleet"), "env-exec-override")
+        benign = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            "    command: node\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {stable}/fleet-mcp\n"
+            "    env:\n"
+            "      LOG_LEVEL: info\n"
+            "      NODE_ENV: production\n"
+        )
+        self.assertEqual(material.fleet_mcp_compatibility(benign, stable, "fleet"), "compatible")
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            body = (
+                "mcp_servers:\n"
+                "  fleet:\n"
+                "    command: node\n"
+                "    args:\n"
+                "      - index.js\n"
+                f"    cwd: {stable}/fleet-mcp\n"
+                "    env:\n"
+                f"      NODE_OPTIONS: {sentinel}\n"
+                f"      LD_PRELOAD: {sentinel}\n"
+            )
+            config = live_dir / "config.yaml"
+            config.write_text(body, encoding="utf-8")
+            before = config.read_bytes()
+            delegation = live_dir / "fleet-delegation.conf"
+            dropin = live_dir / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            active = self._show(MainPID="77", Restart="always", DropInPaths=str(delegation) + " " + str(dropin))
+            code, text, err, commands = self._active_rollback(evidence, live_dir, shows=[active])
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("rollback-detail=env-exec-override", text)
+            self.assertNotIn(sentinel, text)
+            self.assertNotIn(sentinel, err)
+            self._assert_not_success(text)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual(dropin.read_bytes(), b"retirement-v1\n")
+            flat = [" ".join(argv) for argv in commands]
+            self.assertFalse(any(item.endswith("stop " + material.UNIT) or item.endswith("start " + material.UNIT) for item in flat))
+
+    def test_identity_binds_the_recorded_server_name(self):
+        self._require_yaml()
+        stable = "/opt/hermes-fleet-control/stable"
+        body = self._fleet_text(stable, command="node")
+        payload = body.encode()
+
+        def confirm(evidence, live_dir, *, block_yaml=False):
+            delegation = live_dir / "fleet-delegation.conf"
+            shown = self._show(MainPID="12", DropInPaths=str(delegation))
+            env = {"HERMES_FLEET_CONTROL_ROOT": stable}
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            stack = contextlib.ExitStack()
+            if block_yaml:
+                stack.enter_context(self._block_yaml())
+            stack.enter_context(unittest.mock.patch.object(material, "evidence_root", lambda: evidence))
+            stack.enter_context(unittest.mock.patch.object(material, "selected_scope", lambda: ("user", True)))
+            stack.enter_context(unittest.mock.patch.object(material, "_live_gateway", lambda _user: (shown, env, 12)))
+            stack.enter_context(unittest.mock.patch.object(material, "require_pins", lambda *_args: None))
+            stack.enter_context(unittest.mock.patch.object(material, "_cwd_under", lambda *_args: False))
+            with stack, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    code = material.cmd_confirm()
+                except material.Stop:
+                    code = 1
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live_dir, _journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml").write_bytes(payload)
+            (live_dir / "config.yaml").write_bytes(payload)
+            (evidence / "config.mcp-identity").write_text(self._identity(payload), encoding="utf-8")
+            code, text, err = confirm(evidence, live_dir, block_yaml=True)
+            self.assertEqual(code, 0, text + err)
+            self.assertIn("config-mcp-detail=verified-baseline", text)
+            (evidence / "mcp-server.name").write_bytes(b"other\n")
+            code, text, err = confirm(evidence, live_dir, block_yaml=True)
+            self.assertEqual(code, 1, text + err)
+            self.assertNotIn("verified-baseline", text)
+            self.assertIn("config-mcp-detail=yaml-unavailable", text)
+            (evidence / "mcp-server.name").write_bytes(b"fleet\n")
+            (evidence / "config.mcp-identity").write_text(
+                "compatible " + hashlib.sha256(payload).hexdigest() + "\n",
+                encoding="utf-8",
+            )
+            code, text, err = confirm(evidence, live_dir, block_yaml=True)
+            self.assertEqual(code, 1, text + err)
+            self.assertNotIn("verified-baseline", text)
+            self.assertIn("config-mcp-detail=yaml-unavailable", text)
+            (evidence / "mcp-server.name").write_bytes(b"other\n")
+            (evidence / "config.mcp-identity").write_text(self._identity(payload), encoding="utf-8")
+            code, text, err = confirm(evidence, live_dir)
+            self.assertEqual(code, 1, text + err)
+            self.assertNotIn("verified-baseline", text)
+            self.assertIn("config-mcp-detail=fleet-entry-missing", text)
 
 
 if __name__ == "__main__":
