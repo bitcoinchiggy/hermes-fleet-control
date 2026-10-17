@@ -1,8 +1,9 @@
 # First guarded Control deployment readiness
 
 Planning only. Writing this page did not deploy, restart, roll back, SSH,
-open a pull request, or contact a host. Approving this page is Gate A.
-It does not approve a host command, a witness, a deployment, or a rollback.
+open a pull request, transfer a helper, or contact a host. Gate A is
+approved. Gate B is not authorized. This page does not approve a host
+command, a witness, a helper transfer, a deployment, or a rollback.
 
 Helper behavior is the merged tree
 `30e64213d353a487fb84d84443449461b7a76944`. This page does not change
@@ -107,6 +108,8 @@ Unverified until the matching gate runs on a host:
 - Which scope is actually loaded on the host. Preflight can report `unit-scope=system` while a hermes user unit exists. See "User-scope systemd visibility" below. The live result of the hermes user-manager query is unverified.
 - Network reachability of the git origin and of `FLEET_PROVISIONER_URL`. No shipped read-only command probes either one.
 - Any previous evidence directory or an existing `fleet-retirement.conf`.
+- Whether a `docs/deploy/` helper copy already exists on the Control host, and that directory's path, owner, and mode. Absence or a digest mismatch is case B and needs a separate transfer authorization.
+- The deploying user's name, uid, and passwd home. `sudo -u` can keep the caller's `HOME`.
 - VM 1035, VM 1036, and template 1000. Those identifiers are operator-supplied protected infrastructure. They are not recorded elsewhere in this repository.
 
 ### Shared journal locks
@@ -130,7 +133,12 @@ operational failure. Filesystem read-only behavior and operational
 noninterference are different claims. Preflight is read-only for
 persistent files. It is not operationally noninterfering.
 
-Run preflight only when no Fleet operation is in flight. If
+Fleet idle is an operator-confirmed precondition. No command in this
+plan observes it. Before Gate B execution, the operator records the
+assertion in the Gate B approval: no delegate, onboard, or retire
+operation is in flight. If that assertion is missing, STOP.
+
+Run preflight only when that assertion says Fleet is idle. If
 `<scope>-journals=blocked`, or Fleet activity is detected, STOP. Do not
 retry repeatedly or automatically.
 
@@ -140,7 +148,32 @@ retry repeatedly or automatically.
 `XDG_RUNTIME_DIR`. `systemctl --user` then talks to the invoking
 process's user manager. As root, that is root's manager, not the
 hermes user's manager. The current process's `XDG_RUNTIME_DIR` does
-not establish visibility into the hermes user's systemd manager.
+not establish visibility into the hermes user's systemd manager. A
+query typed in a root shell, including `systemctl --user` without an
+identity change, is root's user manager. It is not hermes's.
+
+The system scope and the user scope are different units that share the
+name `hermes-gateway-control.service`. `system-unit=` is the system
+manager. A user-scoped unit is loaded only in a user manager.
+Preflight's `user-unit=` is the invoking process's manager after
+`XDG_RUNTIME_DIR` is cleared.
+
+The hermes user-manager command evaluates the user id inside hermes's
+shell. `id -un` on the first line must be `hermes`. A bus connection
+failure, including a line that says the bus connection failed, is
+unknown visibility. It is not proof the unit is absent. STOP if
+user-unit visibility cannot be established. The command does not
+enable lingering, start a user manager, or modify systemd:
+
+```bash
+sudo -u hermes sh -c 'id -un; XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show -p LoadState --value hermes-gateway-control.service'
+```
+
+A user unit file may also live outside `~/.config/systemd/user`:
+`$XDG_CONFIG_HOME/systemd/user`, `~/.local/share/systemd/user`,
+`/etc/systemd/user`, or `/usr/lib/systemd/user`. A directory listing
+that omits the unit does not prove the unit is absent. Only `LoadState`
+from the hermes user's manager establishes visibility.
 
 `systemctl_loaded` maps exit 127 to `systemctl-absent`. Any other
 nonzero exit becomes `not-loaded`. A nonzero `systemctl` result may
@@ -162,7 +195,7 @@ The Gate B scope commands are listed in "Gate B command inventory".
 
 | Prerequisite | How it is verified | Shipped command | When |
 | --- | --- | --- | --- |
-| Helper copy of `docs/deploy/` from fleet-control `30e64213d353a487fb84d84443449461b7a76944`, mode `0755`, run from the directory that contains that copy | Operator places the copy before any host command. The product checkouts do not contain these commands | None | Before Gate B. Copying onto a host is a host write and needs its own approval inside Gate B's access decision. This plan does not perform that copy |
+| Helper copy of `docs/deploy/` from fleet-control `30e64213d353a487fb84d84443449461b7a76944`, mode `0755`, run from the directory that contains that copy | Case A: an existing copy is verified by the approved `stat` and `sha256sum` checks in the Final Gate B execution sheet. Case B: the copy is missing or the checks do not match. STOP and request a separate transfer authorization. Transfer is a write and is outside read-only Gate B | `stat` and `sha256sum` of the two helper files, only after each is individually approved | Before the preflight command. This plan does not transfer files |
 | `/usr/bin/python3.12` executable and outside `/home/hermes/.hermes/hermes-agent/venv` | Preflight prints `python312=outside-venv`. The wrapper exits 1 when the interpreter is missing | `PYTHONDONTWRITEBYTECODE=1 docs/deploy/c08cb1e-preflight.sh` | Gate B on the Control host |
 | PyYAML already installed for that interpreter | Preflight prints `pyyaml=present`. The helper never installs it. Absent PyYAML makes baseline stop with `yaml-unavailable` and makes confirm stop unless the live file is the byte-identical verified baseline | Same preflight | Gate B. Installing PyYAML is not part of this plan |
 | Node major 20 or newer, and npm, on `PATH=/usr/sbin:/usr/bin:/sbin:/bin` | Preflight prints `node=ok` and `npm=present`. A binary only on another PATH is `absent` | Same preflight | Gate B. `npm ci` is step 4, Gate D |
@@ -171,7 +204,7 @@ The Gate B scope commands are listed in "Gate B command inventory".
 | One loaded unit scope, gateway active and running, live `MainPID`, stable root, `FLEET_CONTROL_PYTHON` absent, `HERMES_FLEET_CONTROL_INTEGRATION=1` | Preflight `host-ready=yes` requires the scope this process can see. Exit 4 when any required fact is missing. `unit-scope=system` does not prove the hermes user unit is absent. Identity and the hermes user manager are separate Gate B commands | Same preflight, plus the scope commands in "Gate B command inventory" | Gate B. Baseline checks the helper's visible scope again and then writes. Gate D waits until decision 4 is unambiguous |
 | `fleet-delegation.conf` loaded, no later drop-in name, `fleet-retirement.conf` absent, `NeedDaemonReload=no`, effective unit does not pin the checkout | Preflight scope facts. Baseline stops if the retirement file is present | Preflight, then baseline | Gate B, then Gate D |
 | Fleet MCP entry stable-compatible for the server named by `HERMES_FLEET_MCP_SERVER` | Preflight classifies command, cwd, and args. `redacted` fails readiness. Baseline runs `fleet_mcp_compatibility` before it writes | Preflight classification is not the full compatibility function | Gate B sees the classification. The full check is step 1, Gate D |
-| Private non-empty journal dirs, and no Fleet operation in flight | Preflight prints `<scope>-journals=private-nonempty` or `blocked`. `blocked` is a STOP. A concurrent delegate, onboard, or retire can receive `delegation_in_flight`, `onboard_in_flight`, or `retire_in_flight` during the shared probe | Preflight shared-lock probe | Gate B. Run only while Fleet is idle. Do not retry in a loop |
+| Private non-empty journal dirs, and Fleet idle | The operator records a Fleet-idle assertion before any Gate B command. Preflight then prints `<scope>-journals=private-nonempty` or `blocked`. `blocked` is a STOP. A concurrent delegate, onboard, or retire can receive `delegation_in_flight`, `onboard_in_flight`, or `retire_in_flight` during the shared probe | Operator assertion, then the preflight shared-lock probe | Before Gate B execution. Do not retry in a loop |
 | Credential names present, values hidden | Baseline prints `present` or `absent` for `FLEET_PROVISIONER_URL` and `FLEET_PROVISIONER_CALLER_TOKEN` | `docs/deploy/c08cb1e_material.py baseline` | Gate D. No shipped read-only command reports these two names |
 | Writable private evidence directory owned by the deploying euid | Baseline creates mode `0700` and refuses a symlink, a foreign owner, or group/world write. Mode `0755` is accepted. An unsafe directory is not chmod'd | Baseline | Gate D. Preflight does not stat this path |
 | Known-good stable checkout on the host | Preflight prints `stable-dir-count=1`, `stable-head-is-dcb3f950=yes`, `stable-tree-is-pinned=yes` | Preflight | Gate B |
@@ -201,7 +234,7 @@ The script takes no arguments. Extra arguments exit 2.
 | Class | READ-ONLY for persistent files. Not operationally noninterfering. See section 6 and "Shared journal locks" |
 | Writes | No intentional file, directory, chmod, fetch, install, daemon-reload, start, stop, or restart. `PYTHONDONTWRITEBYTECODE=1` closes interpreter bytecode writes, including a missing stdlib `.pyc`. Without that variable, `sys.dont_write_bytecode` is set only inside the PyYAML helpers, after the top-level standard-library imports, so a missing stdlib `.pyc` could be created. Reads can still update access times. The shared lock does not write the lock file |
 | Expected output | `preflight=c08cb1e-control`, `read-only=yes`, `diagnostic=completed`, `host-ready=yes` or `host-ready=no`, `host-ready-blockers=...`, `system-unit=`, `user-unit=`, `unit-scope=`, restart policy, triggers, classified MCP fields, `python312`, `pyyaml`, `node`, `npm`, `git`. Origin is `origin-form` and `origin-embedded-token`. The URL is not printed. Credential values are not printed. Hostnames, service names, the origin host, process identifiers, and filesystem paths may be printed. Treat the transcript as an internal operational record |
-| Pass | Exit 0, `diagnostic=completed`, and `host-ready=yes`, with Fleet idle and the intended scope unambiguous |
+| Pass | Exit 0, `diagnostic=completed`, and `host-ready=yes`, after the recorded Fleet-idle assertion and a case A helper copy. Scope visibility is a separate STOP |
 | Fail | Exit 4: diagnostic completed, host not ready. Exit 1: diagnostic failed. Exit 2: bad usage. `<scope>-journals=blocked` is a STOP even if other lines look healthy |
 | On failure | Stop. Leave the host unchanged. Exit 4 is not a pass and does not start step 1. Do not retry repeatedly or automatically. Do not paste the transcript outside the internal review |
 | Risk | Reads `/proc/<pid>/environ` and `config.yaml` in memory and prints classifications. Holds a shared lock on journal `*.lock` files long enough for an in-flight Fleet error. Spawns `hostname`, `systemctl show`, `systemctl list-units`, `git rev-parse`, `git remote get-url`, and maybe `node -p`. User `systemctl --user` runs without `XDG_RUNTIME_DIR` |
@@ -233,136 +266,230 @@ not preflight. Running any of them is outside Gate B.
 
 Checks on the Provisioner or the guest node are outside Gate B.
 Network reachability and guest inventory stay unresolved until Gate D.
-`git fetch`, `git ls-remote`, `npm ci`, `pip install`, and raw `qm list`
-are not Gate B commands.
+During Gate B, every command not individually listed and approved in the Gate B command inventory is prohibited.
 
-## Gate B command inventory
+## Final Gate B execution sheet
 
-Required execution identity and host: the Control host only, as the
-named future deploying user, from a copy of `docs/deploy/` taken from
-fleet-control `30e64213d353a487fb84d84443449461b7a76944`. No Fleet
-operation may be in flight. Approving Gate A does not approve this
-list. Each optional command needs its own explicit approval.
+Gate A is approved. Gate B is not authorized. This sheet is the only
+procedure a later Gate B approval may name. It does not itself
+authorize any command. Unresolved values stay unresolved. Do not invent
+a host, a path, a user, or a search command to fill them.
 
-### Mandatory read-only commands
+### Gate B command inventory
+
+The commands in "Exact approved commands in execution order" are the
+inventory. A command is approved only when the Gate B approval quotes
+that command. During Gate B, every command not individually listed and approved in the Gate B command inventory is prohibited.
+
+### 1. Required Control host identity
+
+Control host: `<UNRESOLVED: Control hostname>`. No other host. Do not
+SSH to the Provisioner or the guest node.
+
+### 2. Required execution user
+
+Deploying user: `<UNRESOLVED: deploying user>`. Preflight and the
+deploying-user commands run in a shell where `id -un` prints that
+name. The hermes user-manager command is the one exception: it is
+`sudo -u hermes` and must print `hermes`. A root shell's own
+`systemctl --user` query is root's user manager, not hermes's.
+
+System scope is the system manager's unit
+`hermes-gateway-control.service`. User scope is the same unit name in
+a user manager. They are different units.
+
+### 3. Operator-confirmed Fleet idle status
+
+Fleet idle is an operator assertion. No command in this sheet shows
+it. Before any command below, record in the Gate B approval:
+"Fleet idle: confirmed by `<UNRESOLVED: operator name>` at
+`<UNRESOLVED: time>`." That means no delegate, onboard, or retire
+operation is in flight. If the assertion is missing, STOP.
+
+### 4. Helper provenance and integrity requirements
+
+Helper source commit: `30e64213d353a487fb84d84443449461b7a76944`.
+Candidate directory: `<UNRESOLVED: docs/deploy directory on the Control host>`.
+If that directory is not already known, the copy is case B. STOP. Do
+not search the host. Do not transfer files.
+
+Case A, verified existing helper copy: both files are regular files,
+mode `755`, and the `sha256sum` output matches the two lines below.
+
+Case B, missing or unverified helper copy: a file is absent, not a
+regular file, not mode `755`, unreadable, or the digest differs.
+STOP and request a separate transfer authorization. Helper transfer
+is a write. It is not part of read-only Gate B approval.
+
+Content hashes below were computed from that commit. They match. No
+mismatch was found. Git blob ids at that commit are
+`5b0f3294b5ad0502777b6383262ceaf626ce20ea` for the shell wrapper and
+`39b31407c5bcdf20ec05f606a23448ce8ba7451c` for the Python helper. Git
+mode is `100755`.
+
+### 5. Exact approved commands in execution order
+
+Each command below stays prohibited until the Gate B approval names
+that command. Run them in this order. Skip none that the approval
+names. Add none that it does not name.
+
+Commands 1 through 5 are optional read-only checks. Each needs its own
+approval line. Command 6 is the mandatory preflight, and only after
+the Fleet-idle assertion and a case A helper result. An approval that
+names command 6 and omits command 1 leaves the helper unverified, so
+preflight stays stopped.
+
+1. From the candidate `docs/deploy` directory:
+
+```bash
+stat -c '%U:%G %a %F %n' c08cb1e-preflight.sh c08cb1e_material.py
+```
+
+```bash
+sha256sum c08cb1e-preflight.sh c08cb1e_material.py
+```
+
+2. As the deploying user:
+
+```bash
+id -u; id -un
+```
+
+3. Evidence parent. If `id -u` printed `0`, run this as root:
+
+```bash
+stat -c '%U:%G %a %F' /var/lib/hermes-control-deploy
+```
+
+If `id -u` printed any other uid, run this as that deploying user.
+`sudo -u` can keep the caller's `HOME`, so this form reads the passwd
+home inside the deploying user's shell:
+
+```bash
+sudo -u <UNRESOLVED: deploying user> sh -c 'id -un; h=$(getent passwd "$(id -un)" | cut -d: -f6); echo "home=$h"; stat -c "%U:%G %a %F" "$h/.local/state/hermes-control-deploy"'
+```
+
+4. Hermes user manager. `$(id -u)` expands inside hermes's shell:
+
+```bash
+sudo -u hermes sh -c 'id -un; XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show -p LoadState --value hermes-gateway-control.service'
+```
+
+5. As root, names only. This listing does not prove the unit is absent:
+
+```bash
+ls -l /home/hermes/.config/systemd/user/hermes-gateway-control.service /home/hermes/.config/systemd/user/hermes-gateway-control.service.d 2>&1
+```
+
+6. From the directory that contains the copied `docs/deploy/` folder,
+as the deploying user. No arguments:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 docs/deploy/c08cb1e-preflight.sh
 ```
 
-No arguments. Extra arguments exit 2. This is the system-scoped gateway
-check as well: read `system-unit=` from its output. That line is this
-process's system manager. It is not a hermes user-manager query.
+### 6. Expected outputs
 
-Expected output: `preflight=c08cb1e-control`, `read-only=yes`,
+`stat` of the helpers: `%F` is `regular file` and `%a` is `755`. Owner
+and group are `<UNRESOLVED: helper file owner on the Control host>`.
+
+`sha256sum`, two lines, in this order:
+
+```text
+78634901d4e7c3335adf8f5c231503ddbc9322b13313178b0088f971e863cff7  c08cb1e-preflight.sh
+2f54b671e58120178bfa7c84ee2d3d86c0e2df236911866b246450c9abaad60d  c08cb1e_material.py
+```
+
+`id -u; id -un`: the deploying user's uid and name.
+
+Evidence `stat`: owner, group, mode, and file type, or the words
+`No such file`. For the non-root form, `id -un` is the deploying user
+and `home=` is that user's passwd home.
+
+Hermes command: the first line is `hermes`. The second line is a
+`LoadState` token such as `loaded` or `not-found`, or a manager error.
+A bus connection failure is unknown visibility.
+
+`ls`: names and modes, or a missing-path message. An omitted name does
+not prove absence. User unit files may also live in
+`$XDG_CONFIG_HOME/systemd/user`, `~/.local/share/systemd/user`,
+`/etc/systemd/user`, or `/usr/lib/systemd/user`.
+
+Preflight: `preflight=c08cb1e-control`, `read-only=yes`,
 `diagnostic=completed`, `host-ready=yes` or `host-ready=no`,
 `host-ready-blockers=...`, `system-unit=`, `user-unit=`,
 `unit-scope=`, `<scope>-journals=`, `<scope>-restart-policy=`,
 `<scope>-triggered-by=`, classified MCP fields, `python312`, `pyyaml`,
 `node`, `npm`, and `git`. Origin is `origin-form` and
 `origin-embedded-token`. The URL is not printed. Credential values are
-not printed. The transcript can contain the hostname, service names,
-the origin host, process identifiers, and filesystem paths. Keep it as
-an internal operational record.
+not printed. `system-unit=` is the system manager. `user-unit=` is the
+invoking user's manager after `XDG_RUNTIME_DIR` is cleared. Compare
+`system-unit=` with the hermes command's `LoadState`. Both `loaded` is
+a scope conflict.
 
-`user-unit=` is this process's user manager after `XDG_RUNTIME_DIR` is
-cleared. As root, that is root's manager. `unit-scope=system` can be
-printed while a user-scoped hermes gateway still exists.
+Pass for preflight: exit 0, `diagnostic=completed`, and
+`host-ready=yes`, after the Fleet-idle assertion and a case A helper
+copy. Exit 4, 1, and 2 are not passes. Extra arguments exit 2.
 
-Pass for this command: exit 0, `diagnostic=completed`,
-`host-ready=yes`, and Fleet was idle for the whole run. Scope is a
-separate STOP. Preflight's own `user-unit=` line does not clear it.
+### 7. STOP conditions
 
-STOP when any of these are true:
-
-- Exit 4, 1, or 2. Exit 4 is not a pass.
+- The Fleet-idle assertion is missing.
+- The helper directory is unknown, or `stat` / `sha256sum` does not match case A. Request a separate transfer authorization. Do not copy the files under this gate.
 - `<scope>-journals=blocked`, or a Fleet delegate, onboard, or retire operation is in flight. Do not retry repeatedly or automatically.
-- User-unit visibility not established, or conflicting gateway unit scopes detected.
-- `host-ready-blockers` is not `none`.
-- `redacted` is treated as a successful MCP check.
+- The hermes command's first line is not `hermes`, or the bus connection failed, or `LoadState` was not obtained.
+- STOP if: User-unit visibility not established, or conflicting gateway unit scopes detected.
+- Preflight exit is 4, 1, or 2. `host-ready-blockers` is not `none`. `redacted` is treated as a successful MCP check.
+- A nonzero `systemctl` result is left unclassified. It may mean the manager is unreachable. It does not by itself mean the unit is absent.
 
 The shared locks do not intentionally modify persistent state. While a
 shared probe is held, a concurrent delegate, onboard, or retire can
 fail immediately with `delegation_in_flight`, `onboard_in_flight`, or
 `retire_in_flight`. `exclusive_delegation_wait` retries
-`delegation_in_flight` for 5 seconds. Run the command only when no
-Fleet operation is in flight.
+`delegation_in_flight` for 5 seconds.
 
 `PYTHONDONTWRITEBYTECODE=1` is inherited by the wrapper. It closes
 interpreter bytecode writes, including a missing standard-library
-`.pyc`. These incidental effects remain: file reads may update access
-times, the process table gains short-lived `hostname`, `systemctl`,
-`git`, and `node -p` processes, and the shared lock is taken and
-released. None of those is an intentional persistent deployment write.
+`.pyc`. File reads may still update access times. Short-lived
+`hostname`, `systemctl`, `git`, and `node -p` processes may appear.
+The shared lock is taken and released. None of those is an intentional
+persistent deployment write.
 
-### Optional read-only commands requiring explicit, per-command approval
+### 8. Transcript handling requirements
 
-Each command stays prohibited until the Gate B approval names that
-command. They do not modify persistent state. `stat` or `ls` printing
-"No such file" is an acceptable answer. Do not `cat` a unit file, a
-drop-in, an env file, or `/proc/*/environ`.
+Keep every transcript as an internal operational record. It must not
+contain credential values. It can contain hostnames, service names,
+repository origins, process identifiers, and filesystem paths. Do not
+paste `config.yaml`, a drop-in, an env file, or `/proc/*/environ` into
+the record. Do not `cat` those files to build the transcript.
 
-Executing user:
+### 9. Explicit prohibition on all unlisted commands
 
-```bash
-id -u; id -un
-```
+During Gate B, every command not individually listed and approved in the Gate B command inventory is prohibited.
 
-Evidence parent. Run the command that matches the deploying euid. As root:
+There is no implied authorization for commands that appear harmless.
+Examples of prohibited actions:
 
-```bash
-stat -c '%U:%G %a %F' /var/lib/hermes-control-deploy
-```
+- SSH to Provisioner or guest nodes.
+- Provisioner or guest-node witness execution.
+- `git fetch`, `pull`, `checkout`, or other repository writes.
+- `git ls-remote` unless separately authorized.
+- `qm` commands.
+- `systemctl start`, `stop`, `restart`, `reload`, `daemon-reload`, `enable`, `disable`, `mask`, `kill`, `edit`, `reset-failed`, or `set-property`.
+- `loginctl enable-linger`.
+- Package installation.
+- Baseline creation, configuration, deployment, rollback, verification, or confirmation.
+- Credential or configuration inspection that prints sensitive values.
 
-Non-root:
-
-```bash
-stat -c '%U:%G %a %F' "$HOME/.local/state/hermes-control-deploy"
-```
-
-Hermes user's systemd manager and the user-scoped gateway. The current
-process's `XDG_RUNTIME_DIR` does not establish that visibility. Run the
-first command as hermes. Run the second as root. The `ls` lists names
-only.
-
-```bash
-XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show -p LoadState --value hermes-gateway-control.service
-```
-
-```bash
-ls -l /home/hermes/.config/systemd/user/hermes-gateway-control.service /home/hermes/.config/systemd/user/hermes-gateway-control.service.d 2>&1
-```
-
-Expected output: a numeric uid and a username; `stat` owner, group,
-mode, and file type, or "No such file"; a `LoadState` token or a
-manager error; `ls` names and modes, or a missing-path message. A
-nonzero `systemctl` result may mean the manager is unreachable. Record
-it for Gate C. It does not by itself prove the unit is absent.
-
-Both scopes: compare preflight `system-unit=` with the hermes
-user-manager `LoadState`. If the system unit is loaded and the hermes
-user unit is also loaded, both scopes are present.
-
-STOP: User-unit visibility not established, or conflicting gateway unit scopes detected.
-
-Outstanding decision 4 stays open until these scope commands have been
-approved and reviewed. Deployment planning approval must not proceed
-to Gate D until the intended service scope is unambiguous.
-
-### Commands prohibited during Gate B
-
-- `docs/deploy/c08cb1e_material.py baseline`
-- `docs/deploy/c08cb1e-provisioner-witness.sh`
-- `docs/deploy/c08cb1e-guest-node-witness.sh`
-- `docs/deploy/c08cb1e_material.py install`
-- `docs/deploy/c08cb1e_material.py configure`
-- `docs/deploy/c08cb1e_material.py restart`
-- `docs/deploy/c08cb1e_material.py verify`
-- `docs/deploy/c08cb1e_material.py rollback`
-- `docs/deploy/c08cb1e_material.py confirm`
-- `npm`, `pip`, and `git fetch`
-- `systemctl start`, `systemctl stop`, `systemctl restart`, and `systemctl daemon-reload`
-- `cat` of env files, `config.yaml`, drop-ins, or `/proc/*/environ`
+The same prohibition covers `docs/deploy/c08cb1e_material.py baseline`,
+`docs/deploy/c08cb1e-provisioner-witness.sh`,
+`docs/deploy/c08cb1e-guest-node-witness.sh`, and
+`docs/deploy/c08cb1e_material.py` with `install`, `configure`,
+`restart`, `verify`, `rollback`, or `confirm`. Enabling lingering,
+starting a user manager, and modifying systemd are prohibited.
+Outstanding decision 4 stays open until the hermes user-manager
+command has been approved and reviewed. Deployment planning approval
+must not proceed to Gate D until the intended service scope is
+unambiguous.
 
 ## 6. Side-effect classification
 
@@ -519,17 +646,20 @@ These gates are separate. Approval of one line does not approve the next.
 
 ### Gate A — readiness plan
 
-Approve or reject this page. No production access. No host command.
+Gate A is approved. This revision adds the Final Gate B execution
+sheet. It grants no host access and no host command.
 
 ### Gate B — read-only preflight
 
-A separate approval uses "Gate B command inventory". The mandatory
-command is `PYTHONDONTWRITEBYTECODE=1 docs/deploy/c08cb1e-preflight.sh`
-on the Control host, with no arguments, run by the named future
-deploying user, and only while no Fleet operation is in flight.
-Optional commands are unapproved until that approval names each one.
-The prohibited list in that section stays prohibited. Approving Gate B
-does not approve deployment.
+Gate B is not authorized. A later approval must name each command from
+the Final Gate B execution sheet individually. The mandatory command,
+after a case A helper copy and a recorded Fleet-idle assertion, is
+`PYTHONDONTWRITEBYTECODE=1 docs/deploy/c08cb1e-preflight.sh` on the
+Control host, with no arguments, as the deploying user. Optional
+commands stay prohibited until that approval names each one. During
+Gate B, every command not individually listed and approved in the Gate
+B command inventory is prohibited. Approving Gate B does not approve
+deployment or a helper transfer.
 
 ### Gate C — preflight evidence review
 
@@ -543,7 +673,7 @@ Gate C checklist:
 - `diagnostic=completed` and `host-ready=yes`, or the blockers are named and the host stays unchanged.
 - `<scope>-journals` is `private-nonempty`. `journals=blocked`, or a reported in-flight Fleet failure, is a STOP. Do not ask for an automatic retry.
 - Resolve every nonzero `systemctl` result. `systemctl_loaded` maps exit 127 to `systemctl-absent` and any other nonzero exit to `not-loaded`. A nonzero result may mean the manager is unreachable rather than that the unit is absent. Record which one it is.
-- Compare `system-unit=` with the hermes user-manager `LoadState` from the approved scope commands. User-unit visibility not established, or conflicting gateway unit scopes detected.
+- Compare `system-unit=` with the hermes user-manager `LoadState` from the approved scope commands. STOP if: User-unit visibility not established, or conflicting gateway unit scopes detected.
 - The transcript contains no credential values. It may contain hostnames, service names, origin hosts, process identifiers, and paths. Leave it in the internal record.
 - `redacted` MCP fields are unresolved configuration, not a pass.
 
@@ -581,7 +711,7 @@ the gate named on each row.
 
 | Order | Gate | Host | Command | Success line |
 | --- | --- | --- | --- | --- |
-| 0 | B, then C | Control | `PYTHONDONTWRITEBYTECODE=1 docs/deploy/c08cb1e-preflight.sh`, plus any optional scope command the Gate B approval names | Exit 0, `host-ready=yes`, Fleet idle. Decision 4 stays open until the hermes user-manager check agrees with `system-unit=` |
+| 0 | B, then C | Control | The commands the Gate B approval individually names, in the order in the Final Gate B execution sheet, ending with `PYTHONDONTWRITEBYTECODE=1 docs/deploy/c08cb1e-preflight.sh` | Exit 0, `host-ready=yes`, after a recorded Fleet-idle assertion and a case A helper copy. Decision 4 stays open until the hermes user-manager line is `hermes` and its `LoadState` agrees with `system-unit=` |
 | 1 | D | Control | `docs/deploy/c08cb1e_material.py baseline` | `STEP 1 OK`, `baseline=created` or a matching re-read |
 | 2 | D | Provisioner, root | `docs/deploy/c08cb1e-provisioner-witness.sh` | `baseline=created` the first time, `PROVISIONER OK` |
 | 3 | D | Guest node, root | `docs/deploy/c08cb1e-guest-node-witness.sh` | `host-mutation=yes`, `baseline=created` the first time, `GUEST-NODE OK` |
@@ -603,7 +733,7 @@ Rows 10–13 are recovery, not the next deploy step.
 
 1. Control, Provisioner, and guest-node hostnames, and confirmation that the roles are on separate machines.
 2. System unit or user unit for `hermes-gateway-control.service`, and the euid that will own the evidence directory for every Control step.
-3. Which optional Gate B commands, if any, are named in the Gate B approval. The identity, evidence-parent `stat`, and hermes user-manager commands stay prohibited until each one is named. Decision 4 cannot close without the identity and user-manager commands.
+3. Which commands from the Final Gate B execution sheet a future Gate B approval names, one by one. Integrity checks, `id`, the evidence-parent `stat`, the hermes `sudo -u hermes sh -c` command, and the root `ls` stay prohibited until each is named. Decision 4 cannot close without the hermes command, and preflight cannot run on a case B helper copy.
 4. The intended scope of `hermes-gateway-control.service`. Preflight clears `XDG_RUNTIME_DIR`, so as root it queries root's user manager and can print `unit-scope=system` while a hermes user unit is loaded. An invisible user-only unit yields `unit-scope=neither` and exit 4, which is fail-closed. `unit-scope=system` beside a hidden user unit is not. Close this decision with the Gate B scope commands before Gate D. Deployment planning approval must not proceed until the intended service scope is unambiguous.
 5. The live provisioner unit name, and approval to import the deployed state loader by running the witness under Gate D.
 6. Approval to let the guest witness write VMID and status rows under Gate D, without printing `qm list` names into chat.
@@ -624,20 +754,19 @@ Historical stable checkout: dcb3f950b142ef0a4dbd355ca7426b0172aa7d7a
 Historical provisioner: b7f4a114ee2ef35b4ff0f1a2abd15efb248576fb
 Hosts: UNRESOLVED until Gate B/D name them
 
-[ ] Gate A approved (this page). No host access yet.
-[ ] Gate B approved. Mandatory command:
-    PYTHONDONTWRITEBYTECODE=1 docs/deploy/c08cb1e-preflight.sh
-    Optional commands are named one by one, or they stay prohibited.
-[ ] No Fleet operation is in flight before preflight.
-    journals=blocked, or an in-flight Fleet error: STOP.
-    Do not retry repeatedly or automatically.
-[ ] Preflight exit 0, diagnostic=completed, host-ready=yes.
-    Exit 4 is not a pass. Stop.
-[ ] User-unit visibility not established, or conflicting gateway
-    unit scopes detected: STOP. Decision 4 stays open.
+[ ] Gate A remains approved. Gate B is not authorized by this page.
+[ ] A later Gate B approval names each command from the Final Gate B
+    execution sheet. Every unlisted command stays prohibited.
+[ ] Operator recorded Fleet idle before any Gate B command.
+[ ] Helper copy is case A: regular files, mode 755, and both sha256
+    lines match. Otherwise STOP and request a separate transfer
+    authorization.
+[ ] Preflight exit is 0, with diagnostic=completed and host-ready=yes.
+[ ] Scope visibility is established and one intended scope is unambiguous.
+    STOP if: User-unit visibility not established, or conflicting gateway unit scopes detected.
 [ ] Gate C reviewed the internal transcript and listed blockers.
-    Every nonzero systemctl result is resolved as unreachable
-    manager or absent unit. Review is not deployment approval.
+    Every nonzero systemctl result is resolved as an unreachable
+    manager or an absent unit. Review is not deployment approval.
 [ ] Gate D is a separate approval, and only after decision 4
     names one unambiguous scope. Not before baseline or either witness.
 [ ] Steps 1–9, same Control user, stop at the first non-zero exit.
