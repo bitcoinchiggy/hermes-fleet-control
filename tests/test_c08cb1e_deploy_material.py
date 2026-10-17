@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import os
@@ -74,7 +75,9 @@ class DeployMaterialTests(unittest.TestCase):
         access = material.classify_mcp_args(["--access-token", "-abcSECRET"])
         self.assertEqual(access, "redacted,redacted")
         self.assertNotIn("abcSECRET", access)
-        self.assertEqual(material.classify_mcp_args(["--token", "node"]), "redacted,public:node")
+        self.assertEqual(material.classify_mcp_args(["--token", "node"]), "redacted,redacted")
+        self.assertEqual(material.classify_mcp_args(["--password", "python3"]), "redacted,redacted")
+        self.assertNotIn("python3", material.classify_mcp_args(["--password", "python3"]))
         self.assertEqual(material.classify_mcp_args(["--version", "node"]), "flag:--version,public:node")
         self.assertNotIn("sk-test-value", material.classify_mcp_args(["--api-key=sk-test-value"]))
         self.assertEqual(material.classify_mcp_text("node"), "public:node")
@@ -99,6 +102,15 @@ class DeployMaterialTests(unittest.TestCase):
         ssh = "ssh://git@example.test/org/repo.git"
         self.assertEqual(material.origin_credential(ssh), "absent")
         self.assertEqual(material.origin_form(ssh)[0], "ssh://example.test")
+        semi = "https://example.test/r.git;tok=semicolon-secret"
+        self.assertEqual(material.origin_credential(semi), "unknown")
+        semi_lines = "\n".join(material.report_origin_decision(semi))
+        self.assertIn("origin-copied=no", semi_lines)
+        self.assertNotIn("semicolon-secret", semi_lines)
+        refused: list[str] = []
+        with self.assertRaises(material.Stop):
+            material.bind_origin(semi, refused.append)
+        self.assertEqual(refused, [])
 
     def test_onboarding_json_is_state_not_a_filename_search(self):
         import tempfile
@@ -489,14 +501,44 @@ class DeployMaterialTests(unittest.TestCase):
     def test_env_key_report_hides_multiline_secrets(self):
         secret = "MIIabc+/xyz,qqq"
         text = "OK_NAME=value\n" + secret + "=not-a-name\n-----BEGIN\nTOKEN=hidden-value\n"
-        names, unparsed = material.env_key_report(text)
-        self.assertEqual(names, ["OK_NAME", "TOKEN"])
-        self.assertEqual(unparsed, 2)
-        rendered = ",".join(names) + str(unparsed)
-        self.assertNotIn(secret, rendered)
-        self.assertNotIn("BEGIN", rendered)
-        self.assertNotIn("hidden-value", rendered)
-        self.assertNotIn("not-a-name", rendered)
+        report = "\n".join(material.env_key_report(text))
+        self.assertIn("fleet-env-name-count=2", report)
+        self.assertIn("fleet-env-unparsed-lines=2", report)
+        self.assertIn("FLEET_PROVISIONER_URL=absent", report)
+        self.assertIn("FLEET_PROVISIONER_CALLER_TOKEN=absent", report)
+        digest = hashlib.sha256(b"OK_NAME\nTOKEN\n").hexdigest()
+        self.assertIn("fleet-env-names-sha256=" + digest, report)
+        for hidden in (secret, "BEGIN", "hidden-value", "not-a-name", "OK_NAME"):
+            self.assertNotIn(hidden, report)
+        allowed = ("fleet-env-", "FLEET_PROVISIONER_URL=", "FLEET_PROVISIONER_CALLER_TOKEN=")
+        self.assertTrue(all(line.startswith(allowed) for line in report.splitlines()))
+        pem = (
+            'SSL_KEY="-----BEGIN PRIVATE KEY-----\n'
+            "q83vEiZZtopSecretTail==\n"
+            '-----END PRIVATE KEY-----"\n'
+            "GOOD=1\n"
+            "OK_NAME=1\n"
+        )
+        pem_report = "\n".join(material.env_key_report(pem))
+        self.assertIn("fleet-env-name-count=3", pem_report)
+        self.assertIn(hashlib.sha256(b"GOOD\nOK_NAME\nSSL_KEY\n").hexdigest(), pem_report)
+        for hidden in ("q83vEiZZtopSecretTail", "SSL_KEY", "GOOD", "OK_NAME", "PRIVATE KEY"):
+            self.assertNotIn(hidden, pem_report)
+        quoted = 'A="line1\nSECRETWORD=abc"\nOK_NAME=1\n'
+        quoted_report = "\n".join(material.env_key_report(quoted))
+        self.assertIn(hashlib.sha256(b"A\nOK_NAME\n").hexdigest(), quoted_report)
+        self.assertNotIn("SECRETWORD", quoted_report)
+        self.assertNotIn("abc", quoted_report)
+        standalone = "GOOD=1\nq83vEiZZtopSecretTail==\n"
+        standalone_report = "\n".join(material.env_key_report(standalone))
+        self.assertNotIn("q83vEiZZtopSecretTail", standalone_report)
+        self.assertNotIn("GOOD", standalone_report)
+        required = "FLEET_PROVISIONER_URL=https://secret.example/token-value\n"
+        required_report = "\n".join(material.env_key_report(required))
+        self.assertIn("FLEET_PROVISIONER_URL=present", required_report)
+        self.assertNotIn("secret.example", required_report)
+        self.assertNotIn("token-value", required_report)
+        self.assertEqual(material.env_key_report(pem), material.env_key_report(pem))
 
     def test_relative_script_rejects_escape_symlink_and_wrong_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -517,6 +559,16 @@ class DeployMaterialTests(unittest.TestCase):
             with unittest.mock.patch.object(material, "resolve_fixed_tool", resolve):
                 good = material.relative_script_fact("node", str(mcp), "index.js", str(root))
                 self.assertEqual(good, "relative-script:index.js")
+                outside_mcp = Path(tmp) / "outside-mcp"
+                outside_mcp.mkdir()
+                (outside_mcp / "index.js").write_text("console.log(1)\n", encoding="utf-8")
+                linked_root = Path(tmp) / "linked-root"
+                linked_root.mkdir()
+                linked_cwd = linked_root / "fleet-mcp"
+                linked_cwd.symlink_to(outside_mcp)
+                self.assertIsNone(
+                    material.relative_script_fact("node", str(linked_cwd), "index.js", str(linked_root))
+                )
                 self.assertIsNone(material.relative_script_fact("node", str(mcp), "../x.js", str(root)))
                 self.assertIsNone(material.relative_script_fact("node", str(root), "index.js", str(root)))
                 script.unlink()
@@ -548,6 +600,10 @@ class DeployMaterialTests(unittest.TestCase):
             material.delegation_location(Path("/etc/systemd/system/unit.d/fleet-delegation.conf"), False),
             "system-config",
         )
+        self.assertEqual(
+            material.delegation_location(Path("/tmp/evil/.config/systemd/user/fleet-delegation.conf"), True),
+            "rejected",
+        )
         with tempfile.TemporaryDirectory() as tmp:
             secret = "MIIabc+/xyz,qqq"
             env_file = Path(tmp) / "fleet.env"
@@ -567,6 +623,26 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertFalse(material.effective_unit_ok(shown, "/opt/stable"))
             shown["ExecStart"] = "/usr/bin/node"
             shown["WorkingDirectory"] = "/opt/stable"
+            self.assertFalse(material.effective_unit_ok(shown, "/opt/stable"))
+            shown["WorkingDirectory"] = "/tmp"
+            missing = Path(tmp) / "missing.env"
+            shown["EnvironmentFiles"] = "-" + str(missing) + " (ignore_errors)"
+            self.assertTrue(material.effective_unit_ok(shown, "/opt/stable"))
+            shown["EnvironmentFiles"] = str(missing)
+            self.assertFalse(material.effective_unit_ok(shown, "/opt/stable"))
+            optional = Path(tmp) / "optional.env"
+            optional.write_text("HERMES_FLEET_CONTROL_ROOT=/opt/new\n", encoding="utf-8")
+            shown["EnvironmentFiles"] = "-" + str(optional) + " (ignore_errors)"
+            self.assertFalse(material.effective_unit_ok(shown, "/opt/stable"))
+            link_env = Path(tmp) / "link.env"
+            link_env.symlink_to(optional)
+            shown["EnvironmentFiles"] = "-" + str(link_env)
+            self.assertFalse(material.effective_unit_ok(shown, "/opt/stable"))
+            shown["EnvironmentFiles"] = "-/opt/stable/fleet.env"
+            self.assertFalse(material.effective_unit_ok(shown, "/opt/stable"))
+            quoted_root = Path(tmp) / "quoted.env"
+            quoted_root.write_text('OTHER="\n/opt/stable\n"\n', encoding="utf-8")
+            shown["EnvironmentFiles"] = str(quoted_root)
             self.assertFalse(material.effective_unit_ok(shown, "/opt/stable"))
 
     def test_private_write_and_shared_lock_probe(self):
@@ -803,25 +879,81 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertTrue(any(item.endswith("restart " + material.UNIT) for item in flat))
             self.assertEqual(material.RESTART_SETTLE_SECONDS, 10)
 
-    def test_rollback_stops_before_touching_config_when_side_file_changes(self):
+    def _failed_rollback(self, evidence: Path, live: Path, *, shows: list[dict[str, str]] | None = None):
+        delegation = live / "fleet-delegation.conf"
+        dropin = live / "fleet-retirement.conf"
+        failed = self._show(
+            ActiveState="failed",
+            SubState="failed",
+            MainPID="0",
+            ExecStart="/opt/hermes-fleet-control/stable/bin/node",
+            DropInPaths=str(delegation) + (" " + str(dropin) if dropin.exists() else ""),
+        )
+        reloaded = self._show(
+            ActiveState="failed",
+            SubState="failed",
+            MainPID="0",
+            ExecStart="/opt/hermes-fleet-control/stable/bin/node",
+            DropInPaths=str(delegation),
+        )
+        running = self._show(MainPID="77", NRestarts="0", DropInPaths=str(delegation))
+        queued = shows if shows is not None else [failed, reloaded, running, dict(running)]
+        commands: list[list[str]] = []
+
+        def fake_show(_user):
+            return queued.pop(0)
+
+        def fake_run(argv, cwd=None):
+            commands.append(argv)
+            return 0, ""
+
+        def fake_env(pid):
+            if pid == 77:
+                return {"HERMES_FLEET_CONTROL_ROOT": "/opt/hermes-fleet-control/stable"}
+            return None
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with unittest.mock.patch.object(material, "evidence_root", lambda: evidence), unittest.mock.patch.object(
+            material, "systemctl_show", fake_show
+        ), unittest.mock.patch.object(material, "_run", fake_run), unittest.mock.patch.object(
+            material, "read_environ", fake_env
+        ), unittest.mock.patch.object(material.time, "sleep", lambda seconds: None), contextlib.redirect_stdout(
+            stdout
+        ), contextlib.redirect_stderr(stderr):
+            try:
+                code = material.cmd_rollback()
+            except material.Stop:
+                code = 1
+        return code, stdout.getvalue(), stderr.getvalue(), commands
+
+    def test_rollback_warns_on_side_file_drift_and_keeps_those_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             evidence, live, journal = self._evidence(Path(tmp))
             (live / "profile.env").write_text("A=changed\n", encoding="utf-8")
             os.chmod(live / "profile.env", 0o600)
-            before = (live / "config.yaml").read_bytes()
-            shown = self._show(ActiveState="failed", SubState="failed", MainPID="0")
-            stdout = io.StringIO()
-            with unittest.mock.patch.object(material, "evidence_root", lambda: evidence), unittest.mock.patch.object(
-                material, "systemctl_show", lambda _user: shown
-            ), unittest.mock.patch.object(material, "_run", lambda argv, cwd=None: (0, "")), contextlib.redirect_stdout(
-                stdout
-            ):
-                with self.assertRaises(material.Stop):
-                    material.cmd_rollback()
-            self.assertEqual((live / "config.yaml").read_bytes(), before)
+            (live / "fleet.env").write_text("B=drift\n", encoding="utf-8")
+            (live / "unit.fragment").write_text("[Unit]\nDrift=1\n", encoding="utf-8")
+            (live / "fleet-delegation.conf").write_text("[Service]\nEnvironment=PATH=/usr/bin\nDrift=1\n", encoding="utf-8")
+            dropin = live / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            code, text, _err, commands = self._failed_rollback(evidence, live)
+            self.assertEqual(code, 0, text)
+            self.assertIn("side-file-drift=profile.env.path,fleet.env.path,unit.fragment.path", text)
+            self.assertIn("WARNING: side file differs from baseline; rollback will not modify it", text)
+            self.assertIn("delegation-drift=changed", text)
+            self.assertIn("WARNING: delegation file differs from baseline; rollback will not modify it", text)
+            self.assertIn("config-rollback=restored", text)
+            self.assertIn("rollback=done", text)
+            self.assertEqual((live / "profile.env").read_text(encoding="utf-8"), "A=changed\n")
+            self.assertEqual((live / "fleet.env").read_text(encoding="utf-8"), "B=drift\n")
+            self.assertEqual((live / "unit.fragment").read_text(encoding="utf-8"), "[Unit]\nDrift=1\n")
+            self.assertIn("Drift=1", (live / "fleet-delegation.conf").read_text(encoding="utf-8"))
+            self.assertEqual((live / "config.yaml").read_bytes(), b"baseline-config\n")
+            self.assertFalse(dropin.exists())
             self.assertEqual(journal.read_text(encoding="utf-8"), "journal-v1")
-            self.assertFalse((live / "fleet-retirement.conf").exists())
-            self.assertIn("journal-warning=", stdout.getvalue())
+            flat = [" ".join(argv) for argv in commands]
+            self.assertTrue(any(item.endswith("restart " + material.UNIT) for item in flat))
 
     def test_rollback_already_stable_still_reloads(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -927,6 +1059,403 @@ class DeployMaterialTests(unittest.TestCase):
         self.assertIn("status=1", completed.stdout)
         self.assertIn("STOP: evidence path is a symlink", completed.stdout)
         self.assertIn("wrote=no", completed.stdout)
+
+    def test_rollback_reverses_config_drift_and_preserves_unrelated_keys(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML is not installed")
+        stable = "/opt/hermes-fleet-control/stable"
+        new = str(material.NEW)
+        deployed = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            f"    command: {new}/fleet-mcp/index.js\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {new}/fleet-mcp\n"
+            "note: keep\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live, journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            drifted = deployed + "extra: operator\n"
+            config = live / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            dropin = live / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            code, text, _err, _commands = self._failed_rollback(evidence, live)
+            self.assertEqual(code, 0, text)
+            self.assertIn("config-rollback=reversed", text)
+            self.assertIn("rollback=done", text)
+            restored = config.read_text(encoding="utf-8")
+            self.assertNotIn(new, restored)
+            self.assertIn(stable + "/fleet-mcp", restored)
+            self.assertIn("extra: operator", restored)
+            self.assertIn("note: keep", restored)
+            self.assertEqual(journal.read_text(encoding="utf-8"), "journal-v1")
+            self.assertFalse(dropin.exists())
+
+    def test_rollback_preserves_unsafe_config_and_does_not_restart(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML is not installed")
+        new = str(material.NEW)
+        deployed = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            f"    command: {new}/fleet-mcp/index.js\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {new}/fleet-mcp\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence, live, journal = self._evidence(Path(tmp))
+            (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+            drifted = deployed + f"elsewhere: {new}/outside\n"
+            config = live / "config.yaml"
+            config.write_text(drifted, encoding="utf-8")
+            before = config.read_bytes()
+            dropin = live / "fleet-retirement.conf"
+            dropin.write_bytes(b"retirement-v1\n")
+            delegation = live / "fleet-delegation.conf"
+            failed = self._show(
+                ActiveState="inactive",
+                SubState="dead",
+                MainPID="0",
+                DropInPaths=str(delegation) + " " + str(dropin),
+            )
+            reloaded = self._show(ActiveState="inactive", SubState="dead", MainPID="0", DropInPaths=str(delegation))
+            code, text, err, commands = self._failed_rollback(evidence, live, shows=[failed, reloaded])
+            self.assertEqual(code, 1, text + err)
+            self.assertIn("config-rollback=incomplete", text)
+            self.assertIn("rollback=incomplete", text)
+            self.assertIn("operator intervention required", err)
+            self.assertNotIn("rollback=done", text)
+            self.assertNotIn("STEP 10 OK", text)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertFalse(dropin.exists())
+            self.assertEqual(journal.read_text(encoding="utf-8"), "journal-v1")
+            flat = [" ".join(argv) for argv in commands]
+            self.assertFalse(any("restart" in item for item in flat))
+
+    def test_confirm_reports_journal_drift_and_rejects_new_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence, live, journal = self._evidence(root)
+            for leaf in ("fleet-delegations", "fleet-onboarding", "fleet-retirements"):
+                directory = root / leaf
+                directory.mkdir(mode=0o700)
+                os.chmod(directory, 0o700)
+                (directory / "row.json").write_text("{}\n", encoding="utf-8")
+            env = {
+                "HERMES_FLEET_CONTROL_ROOT": "/opt/hermes-fleet-control/stable",
+                "FLEET_DELEGATION_JOURNAL_DIR": str(root / "fleet-delegations"),
+                "FLEET_ONBOARD_JOURNAL_DIR": str(root / "fleet-onboarding"),
+                "FLEET_RETIRE_JOURNAL_DIR": str(root / "fleet-retirements"),
+            }
+            (evidence / "journals.manifest").write_bytes(material.journal_manifest(env).encode())
+            journal.write_text("journal-v2", encoding="utf-8")
+            (root / "fleet-delegations" / "row.json").write_text('{"added":true}\n', encoding="utf-8")
+            (live / "fleet.env").write_text("B=drift\n", encoding="utf-8")
+            (live / "config.yaml").write_bytes(b"baseline-config\nextra: kept\n")
+            delegation = live / "fleet-delegation.conf"
+            shown = self._show(MainPID="12", DropInPaths=str(delegation))
+            stdout = io.StringIO()
+            with unittest.mock.patch.object(material, "evidence_root", lambda: evidence), unittest.mock.patch.object(
+                material, "selected_scope", lambda: ("user", True)
+            ), unittest.mock.patch.object(
+                material, "_live_gateway", lambda _user: (shown, env, 12)
+            ), unittest.mock.patch.object(material, "require_pins", lambda *_args: None), unittest.mock.patch.object(
+                material, "_cwd_under", lambda *_args: False
+            ), contextlib.redirect_stdout(stdout):
+                code = material.cmd_confirm()
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("journal-warning=changed", text)
+            self.assertIn("WARNING: journal manifest changed; confirm will not modify journals", text)
+            self.assertIn("side-file-drift=fleet.env.path", text)
+            self.assertIn("STEP 11 OK", text)
+            self.assertEqual((root / "fleet-delegations" / "row.json").read_text(encoding="utf-8"), '{"added":true}\n')
+            self.assertEqual((live / "fleet.env").read_text(encoding="utf-8"), "B=drift\n")
+            self.assertEqual((live / "config.yaml").read_bytes(), b"baseline-config\nextra: kept\n")
+            config = live / "config.yaml"
+            config.write_text("root: " + str(material.NEW) + "\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with unittest.mock.patch.object(material, "evidence_root", lambda: evidence), unittest.mock.patch.object(
+                material, "selected_scope", lambda: ("user", True)
+            ), unittest.mock.patch.object(
+                material, "_live_gateway", lambda _user: (shown, env, 12)
+            ), unittest.mock.patch.object(material, "require_pins", lambda *_args: None), unittest.mock.patch.object(
+                material, "_cwd_under", lambda *_args: False
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(material.Stop):
+                    material.cmd_confirm()
+            self.assertIn("names the new checkout", stderr.getvalue())
+            self.assertEqual(config.read_text(encoding="utf-8"), "root: " + str(material.NEW) + "\n")
+
+    def test_shared_lock_stops_conflicting_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence, live, journal = self._evidence(root)
+            before = {path: path.read_bytes() for path in live.rglob("*") if path.is_file()}
+            journal_before = journal.read_bytes()
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import fcntl, os, sys, time\n"
+                    "fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)\n"
+                    "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                    "sys.stdout.write('held\\n')\n"
+                    "sys.stdout.flush()\n"
+                    "time.sleep(30)\n",
+                    str(evidence.parent),
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline(), "held\n")
+                for command in (
+                    material.cmd_baseline,
+                    material.cmd_configure,
+                    material.cmd_restart,
+                    material.cmd_verify,
+                    material.cmd_rollback,
+                    material.cmd_confirm,
+                ):
+                    stderr = io.StringIO()
+                    with unittest.mock.patch.object(
+                        material, "evidence_root", lambda evidence=evidence: evidence
+                    ), unittest.mock.patch.object(
+                        material, "LOCK_WAIT_SECONDS", 0
+                    ), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(material.Stop):
+                            command()
+                    self.assertIn("another deploy command holds the evidence lock", stderr.getvalue())
+            finally:
+                holder.kill()
+                holder.wait(timeout=5)
+                if holder.stdout is not None:
+                    holder.stdout.close()
+            self.assertEqual(journal.read_bytes(), journal_before)
+            for path, data in before.items():
+                self.assertEqual(path.read_bytes(), data)
+
+    def test_partial_baseline_is_rewritten_and_journals_stay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence = root / "sha"
+            journal = root / "journal.txt"
+            journal.write_text("journal-body", encoding="utf-8")
+            os.chmod(journal, 0o600)
+            files = {
+                "journals.manifest": b"manifest-v1\n",
+                "config.yaml": b"config-v1\n",
+                "scope": b"user\n",
+            }
+            order: list[str] = []
+            real_write = material._private_write
+
+            def boom(path, data):
+                order.append(path.name)
+                if path.name == "config.yaml":
+                    raise OSError("interrupted")
+                return real_write(path, data)
+
+            with unittest.mock.patch.object(material, "_private_write", boom):
+                with self.assertRaises(OSError):
+                    material._save_baseline(evidence, files)
+            self.assertEqual(order, ["config.yaml"])
+            self.assertFalse(evidence.exists())
+            self.assertFalse((root / "sha.staging").exists())
+            self.assertEqual(journal.read_text(encoding="utf-8"), "journal-body")
+            evidence.mkdir()
+            (evidence / "journals.manifest").write_bytes(b"partial\n")
+            (evidence / "extra").write_text("leave-me", encoding="utf-8")
+            with self.assertRaises(material.Stop):
+                material._save_baseline(evidence, files)
+            self.assertEqual((evidence / "extra").read_text(encoding="utf-8"), "leave-me")
+            self.assertEqual((evidence / "journals.manifest").read_bytes(), b"partial\n")
+            (evidence / "extra").unlink()
+            self.assertEqual(material._save_baseline(evidence, files), "created")
+            self.assertEqual((evidence / "journals.manifest").read_bytes(), b"manifest-v1\n")
+            self.assertEqual((evidence / "config.yaml").read_bytes(), b"config-v1\n")
+            self.assertEqual(stat.S_IMODE(evidence.stat().st_mode) & 0o077, 0)
+            self.assertEqual(material._save_baseline(evidence, files), "matched")
+            changed = dict(files)
+            changed["scope"] = b"system\n"
+            with self.assertRaises(material.Stop):
+                material._save_baseline(evidence, changed)
+            self.assertEqual((evidence / "scope").read_bytes(), b"user\n")
+            self.assertEqual(journal.read_text(encoding="utf-8"), "journal-body")
+
+    def test_preflight_loaded_unit_still_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stable = root / "dcb3f950-checkout"
+            stable.mkdir()
+            home = root / "home"
+            delegation = home / ".config" / "systemd" / "user" / "hermes.service.d" / "fleet-delegation.conf"
+            delegation.parent.mkdir(parents=True)
+            delegation.write_text("[Service]\n", encoding="utf-8")
+            profiles = root / "profiles"
+            config = profiles / "control" / "config.yaml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                "mcp_servers:\n  fleet:\n    command: node\n    args: []\n    cwd: /tmp\n",
+                encoding="utf-8",
+            )
+            fleet_env = root / "fleet.env"
+            fleet_env.write_text("PLAIN=1\nenv-body-secret=hidden\n", encoding="utf-8")
+            journals = {}
+            for leaf, key in (
+                ("fleet-delegations", "FLEET_DELEGATION_JOURNAL_DIR"),
+                ("fleet-onboarding", "FLEET_ONBOARD_JOURNAL_DIR"),
+                ("fleet-retirements", "FLEET_RETIRE_JOURNAL_DIR"),
+            ):
+                directory = root / leaf
+                directory.mkdir(mode=0o700)
+                os.chmod(directory, 0o700)
+                (directory / "row.json").write_text("journal-body-secret\n", encoding="utf-8")
+                journals[key] = str(directory)
+            pid = str(os.getpid())
+            props = {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "MainPID": pid,
+                "NRestarts": "0",
+                "FragmentPath": "/etc/systemd/system/hermes-gateway-control.service",
+                "DropInPaths": str(delegation),
+                "NeedDaemonReload": "no",
+                "EnvironmentFiles": str(fleet_env) + " (ignore_errors)",
+                "ExecStart": "/usr/bin/node",
+                "WorkingDirectory": "/tmp",
+            }
+            show_text = "".join(key + "=" + value + "\n" for key, value in props.items())
+            seen: list[list[str]] = []
+
+            def fake_run(argv, cwd=None):
+                seen.append(argv)
+                if argv[:2] == ["hostname", "-s"]:
+                    return 0, "control\n"
+                if argv[:2] == ["hostname", "-f"]:
+                    return 0, "control.example\n"
+                if argv and argv[0] == "git":
+                    if argv[-2:] == ["rev-parse", "HEAD"]:
+                        return 0, material.STABLE_SHA + "\n"
+                    if argv[-1] == "HEAD^{tree}":
+                        return 0, material.STABLE_TREE + "\n"
+                    if "get-url" in argv:
+                        return 0, "https://example.test/org/repo.git\n"
+                    return 0, ""
+                if argv and argv[0] == "systemctl":
+                    if "list-units" in argv:
+                        return 0, ""
+                    if "LoadState" in argv:
+                        return (0, "loaded\n") if "--user" in argv else (0, "not-loaded\n")
+                    if "--user" in argv:
+                        return 0, show_text
+                    return 0, "not-loaded\n"
+                if argv and argv[0].endswith("node"):
+                    return 0, "22\n"
+                return 0, ""
+
+            env = {
+                "HERMES_FLEET_CONTROL_ROOT": str(stable),
+                "HERMES_FLEET_CONTROL_INTEGRATION": "1",
+                "HERMES_FLEET_MCP_SERVER": "fleet",
+                "FLEET_CONTROL_HERMES_PROFILE": "control",
+                "FLEET_CONTROL_PROFILES_ROOT": str(profiles),
+                "HERMES_HOME": str(home),
+                "FLEET_CONTROL_ENV_FILE": str(fleet_env),
+            }
+            env.update(journals)
+            writes: list[str] = []
+            real_open = os.open
+
+            def guard(path, flags, *args, **kwargs):
+                if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC):
+                    writes.append(str(path))
+                return real_open(path, flags, *args, **kwargs)
+
+            stdout = io.StringIO()
+            with unittest.mock.patch("os.open", guard), unittest.mock.patch.object(
+                material, "_run", fake_run
+            ), unittest.mock.patch.object(material, "stable_dirs", lambda: [stable]), unittest.mock.patch.object(
+                material, "read_environ", lambda _pid: env
+            ), unittest.mock.patch.object(material.Path, "home", lambda: home), contextlib.redirect_stdout(stdout):
+                code = material.cmd_preflight()
+            text = stdout.getvalue()
+            self.assertEqual(writes, [])
+            self.assertIn(code, (0, 4))
+            self.assertIn("user-unit=loaded", text)
+            self.assertIn("system-unit=not-loaded", text)
+            self.assertTrue("user-mcp-command=public:node" in text or "user-mcp-config=unparsed" in text)
+            self.assertIn("user-journals=private-nonempty", text)
+            self.assertNotIn("env-body-secret", text)
+            self.assertNotIn("journal-body-secret", text)
+            self.assertTrue(any(argv[0] == "systemctl" and "--user" in argv for argv in seen))
+            self.assertFalse(any(argv[0] == "systemctl" and argv[1:3] == ["start", material.UNIT] for argv in seen))
+
+    def test_guest_node_witness_reports_a_held_lock(self):
+        witness = ROOT / "docs" / "deploy" / "c08cb1e-guest-node-witness.sh"
+        stub = Path(tempfile.mkdtemp())
+        (stub / "qm").write_text("#!/bin/sh\necho 'VMID NAME STATUS'\necho '101 alpha running'\n", encoding="utf-8")
+        (stub / "systemctl").write_text("#!/bin/sh\necho not-found\nexit 0\n", encoding="utf-8")
+        os.chmod(stub / "qm", 0o755)
+        os.chmod(stub / "systemctl", 0o755)
+        path = str(stub) + ":" + os.environ["PATH"]
+        inner = textwrap.dedent(
+            f"""\
+            set -euo pipefail
+            saved=$(mktemp -d)
+            mount --bind /etc/alternatives "$saved"
+            newetc=$(mktemp -d)
+            mount -t tmpfs tmpfs "$newetc"
+            mount --bind "$newetc" /etc
+            mkdir -p /etc/pve /etc/alternatives
+            mount --bind "$saved" /etc/alternatives
+            mount -t tmpfs tmpfs /var/lib
+            export PATH={path}
+            bash {witness}
+            evidence=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness
+            digest=$(sha256sum "$evidence/qm-baseline.txt")
+            flock -n "$evidence/lock" sleep 30 &
+            holder=$!
+            held=no
+            for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+              if ! flock -n "$evidence/lock" true; then
+                held=yes
+                break
+              fi
+              sleep 0.05
+            done
+            set +e
+            bash {witness} >/var/lib/second.out 2>/var/lib/second.err
+            status=$?
+            set -e
+            echo status=$status
+            echo held=$held
+            echo digest-same=$(test "$(sha256sum "$evidence/qm-baseline.txt")" = "$digest" && echo yes || echo no)
+            cat /var/lib/second.err
+            kill "$holder"
+            """
+        )
+        completed = subprocess.run(
+            ["unshare", "--user", "--mount", "--map-root-user", "bash", "-c", inner],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("status=1", completed.stdout)
+        self.assertIn("held=yes", completed.stdout)
+        self.assertIn("STOP: evidence lock is held", completed.stdout)
+        self.assertIn("digest-same=yes", completed.stdout)
 
 
 if __name__ == "__main__":
