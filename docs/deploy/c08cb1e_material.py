@@ -107,6 +107,8 @@ EXEC_ENV_KEYS = frozenset(
         "PYTHONUSERBASE",
         "PYTHONSAFEPATH",
         "PYTHONDEVMODE",
+        "FLEET_CONTROL_PYTHON",
+        "PATH",
     }
 )
 _POLICY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
@@ -1296,7 +1298,12 @@ def cmd_preflight() -> int:
 
 
 def _exec_env_override(key: str) -> bool:
-    """True for a Node, Python, or dynamic-linker setting that changes execution."""
+    """True for an env key that changes which code or binary runs.
+
+    Names are exact and case-sensitive, plus any ``LD_`` prefix.
+    ``FLEET_CONTROL_PYTHON`` and ``PATH`` are included because they
+    select the interpreter or the command binary. The value is not read.
+    """
     return key in EXEC_ENV_KEYS or key.startswith("LD_")
 
 
@@ -2938,12 +2945,34 @@ def _running_root(before: int, env: dict[str, str] | None, stable: str) -> str:
     """new, stable, none, or unknown. none means no running gateway process."""
     if before <= 1 or env is None:
         return "none"
-    root = env.get("HERMES_FLEET_CONTROL_ROOT", "")
+    return _classify_root(env.get("HERMES_FLEET_CONTROL_ROOT", ""), stable)
+
+
+def _classify_root(root: str, stable: str) -> str:
+    """new, stable, or unknown. Does not print the path."""
     if root == str(NEW):
         return "new"
     if root == stable:
         return "stable"
     return "unknown"
+
+
+def _live_root_label(shown: dict[str, str], stable: str) -> str:
+    """Root of a unit that did not stay stopped. Does not stop or start it.
+
+    none means there is no main process. unknown means a main process
+    exists but its root cannot be classified. The path is not printed.
+    """
+    try:
+        pid = int(shown.get("MainPID", "0"))
+    except ValueError:
+        pid = 0
+    if pid <= 1:
+        return "none"
+    env = read_environ(pid)
+    if env is None:
+        return "unknown"
+    return _classify_root(env.get("HERMES_FLEET_CONTROL_ROOT", ""), stable)
 
 
 def _next_start_root(dropin: Path, desired: bytes | None) -> str:
@@ -3042,6 +3071,7 @@ def _rollback_refuse(
     detail: str,
     completed: str = "none",
     incomplete: str = "dropin,config,restart",
+    repeat_status: bool = True,
 ) -> None:
     """Stop before a successful rollback. Does not print config text or secret values."""
     out("running-root=" + running)
@@ -3049,8 +3079,9 @@ def _rollback_refuse(
     out("config-names-new=" + names_new)
     out("rollback-completed=" + completed)
     out("rollback-incomplete=" + incomplete)
-    out("dropin-rollback=" + dropin_status)
-    out("config-rollback=" + config_status)
+    if repeat_status:
+        out("dropin-rollback=" + dropin_status)
+        out("config-rollback=" + config_status)
     out("rollback-reason=" + reason)
     out("rollback-detail=" + detail)
     warn("do not restart the gateway until rollback completes")
@@ -3390,7 +3421,7 @@ def _cmd_rollback_locked() -> int:
         )
     if not _stop_held(reloaded):
         _rollback_refuse(
-            running="none",
+            running=_live_root_label(reloaded, stable),
             next_start="stable",
             names_new="no",
             dropin_status="removed" if dropin_plan == "removable" else "absent",
@@ -3399,6 +3430,7 @@ def _cmd_rollback_locked() -> int:
             detail="stop-unverified",
             completed="dropin,config",
             incomplete="restart",
+            repeat_status=False,
         )
     _start_stopped(user, before, stable, False)
     out("rollback=done")

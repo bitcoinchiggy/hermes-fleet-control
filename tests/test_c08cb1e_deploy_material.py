@@ -2699,6 +2699,7 @@ class DeployMaterialTests(unittest.TestCase):
         cgroup=None,
         removal=None,
         apply=None,
+        roots: dict[int, str | None] | None = None,
     ):
         commands: list[list[str]] = []
 
@@ -2712,6 +2713,11 @@ class DeployMaterialTests(unittest.TestCase):
             return 0, ""
 
         def fake_env(pid):
+            if roots is not None and pid in roots:
+                value = roots[pid]
+                if value is None:
+                    return None
+                return {"HERMES_FLEET_CONTROL_ROOT": value}
             if pid in {77, 88}:
                 return {"HERMES_FLEET_CONTROL_ROOT": "/opt/hermes-fleet-control/stable"}
             return None
@@ -3285,13 +3291,55 @@ class DeployMaterialTests(unittest.TestCase):
             self.assertIn("rollback-detail=stop-unverified", text)
             self.assertIn("rollback-reason=gateway did not stay stopped", text)
             self.assertIn("rollback-incomplete=restart", text)
+            self.assertIn("running-root=unknown", text)
+            self.assertEqual(text.count("dropin-rollback="), 1)
+            self.assertEqual(text.count("config-rollback="), 1)
             self._assert_not_success(text)
             self.assertNotIn(new, config.read_text(encoding="utf-8"))
             self.assertIn(stable, config.read_text(encoding="utf-8"))
             self.assertFalse(dropin.exists())
             flat = [" ".join(argv) for argv in commands]
             self.assertTrue(any("daemon-reload" in item for item in flat))
+            self.assertEqual(sum(item.endswith("stop " + material.UNIT) for item in flat), 1)
             self.assertFalse(any(item.endswith("start " + material.UNIT) for item in flat))
+            hidden = "/tmp/not-a-checkout"
+            for label, root, expected in (
+                ("reported-new", new, "new"),
+                ("reported-stable", stable, "stable"),
+                ("reported-hidden", hidden, "unknown"),
+            ):
+                case_root = Path(tmp) / label
+                case_root.mkdir()
+                evidence, live_dir, _journal = self._evidence(case_root)
+                (evidence / "config.yaml.deployed").write_bytes(deployed.encode())
+                config = live_dir / "config.yaml"
+                config.write_text(drifted, encoding="utf-8")
+                delegation = live_dir / "fleet-delegation.conf"
+                dropin = live_dir / "fleet-retirement.conf"
+                dropin.write_bytes(b"retirement-v1\n")
+                active = self._show(MainPID="77", Restart="always", DropInPaths=str(delegation) + " " + str(dropin))
+                stopped = self._show(
+                    ActiveState="inactive", SubState="dead", MainPID="0", Restart="always", DropInPaths=str(delegation)
+                )
+                returned = self._show(MainPID="90", Restart="always", DropInPaths=str(delegation))
+                code, text, err, commands = self._active_rollback(
+                    evidence,
+                    live_dir,
+                    shows=[dict(active), dict(stopped), dict(stopped), dict(returned)],
+                    roots={90: root},
+                )
+                self.assertEqual(code, 1, text + err)
+                self.assertIn("running-root=" + expected, text)
+                self.assertNotIn(hidden, text)
+                self.assertNotIn(hidden, err)
+                self.assertNotIn(new, text)
+                self.assertEqual(text.count("dropin-rollback="), 1)
+                self.assertEqual(text.count("config-rollback="), 1)
+                self.assertFalse(any(item.endswith("start " + material.UNIT) for item in [" ".join(argv) for argv in commands]))
+                self.assertEqual(
+                    sum(item.endswith("stop " + material.UNIT) for item in [" ".join(argv) for argv in commands]),
+                    1,
+                )
 
     def test_namespace_probe_names_the_reason_when_unshare_fails(self):
         global _NAMESPACE_REASON
@@ -3364,6 +3412,8 @@ class DeployMaterialTests(unittest.TestCase):
             "LD_PRELOAD",
             "LD_LIBRARY_PATH",
             "LD_AUDIT",
+            "FLEET_CONTROL_PYTHON",
+            "PATH",
         )
         for key in keys:
             with self.subTest(key=key):
@@ -3389,6 +3439,29 @@ class DeployMaterialTests(unittest.TestCase):
             "      NODE_OPTIONS: ''\n"
         )
         self.assertEqual(material.fleet_mcp_compatibility(empty, stable, "fleet"), "env-exec-override")
+        for key in ("FLEET_CONTROL_PYTHON", "PATH"):
+            blank = (
+                "mcp_servers:\n"
+                "  fleet:\n"
+                "    command: node\n"
+                "    args:\n"
+                "      - index.js\n"
+                f"    cwd: {stable}/fleet-mcp\n"
+                "    env:\n"
+                f"      {key}: ''\n"
+            )
+            self.assertEqual(material.fleet_mcp_compatibility(blank, stable, "fleet"), "env-exec-override")
+        lowercase = (
+            "mcp_servers:\n"
+            "  fleet:\n"
+            "    command: node\n"
+            "    args:\n"
+            "      - index.js\n"
+            f"    cwd: {stable}/fleet-mcp\n"
+            "    env:\n"
+            "      path: /usr/bin\n"
+        )
+        self.assertEqual(material.fleet_mcp_compatibility(lowercase, stable, "fleet"), "compatible")
         anchored = (
             "mcp_servers:\n"
             "  fleet:\n"

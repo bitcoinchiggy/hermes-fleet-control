@@ -330,10 +330,10 @@ names and paths may be printed. Do not print values whose keys match
   when its value is the stable path. `NODE_OPTIONS`, `NODE_PATH`,
   `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONINSPECT`,
   `PYTHONEXECUTABLE`, `PYTHONUSERBASE`, `PYTHONSAFEPATH`,
-  `PYTHONDEVMODE`, and any key that starts with `LD_` are
-  `env-exec-override` even when the value is empty or names the
-  stable checkout. The value is not printed. `NODE_ENV` is not in
-  that set. A non-canonical spelling of the new checkout, another
+  `PYTHONDEVMODE`, `FLEET_CONTROL_PYTHON`, `PATH`, and any key that
+  starts with `LD_` are `env-exec-override` even when the value is
+  empty or names the stable checkout. The value is not printed.
+  `NODE_ENV` is not in that set. A non-canonical spelling of the new checkout, another
   checkout anywhere in the file, a relative new-checkout cwd, or a
   variable path that contains `..` is incomplete. Unrelated keys are
   kept. An unverified retirement drop-in skips the config write and
@@ -786,7 +786,12 @@ and does not start. `daemon-reload` runs only after that config step.
 `NeedDaemonReload=no`. A failed reload does not start. The command
 then runs `systemctl start` only when that post-reload show is still
 verified stopped. A unit that came back is `stop-unverified` and is
-not started. Start is for the same scope and requires a new
+not started. That refusal reads the new main process, when there is
+one, and prints `running-root` as `new`, `stable`, or `unknown`. It
+does not print the path, and it does not stop the unit again.
+`running-root=none` is used only when there is no main process.
+`dropin-rollback` and `config-rollback` are not printed a second
+time. Start is for the same scope and requires a new
 `MainPID`, active/running, the stable root, delegation loaded, the
 retirement drop-in unloaded, and `FLEET_CONTROL_PYTHON` unset. The
 start waits about 10 seconds and re-reads. `NRestarts` is not required
