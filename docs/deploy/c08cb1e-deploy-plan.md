@@ -1,24 +1,22 @@
 # Guarded Control deploy for c08cb1e
 
-Paste for `c08cb1ebd073ee7946f49005dd45071366eeb688`. Writing this page
-did not deploy, restart, SSH, open a pull request, or contact a host.
-Do not paste evidence, a unit dump, or an env file into chat. Output is
-key names, paths, worker names, and checksums. Secret values are not printed.
+Operator commands for `c08cb1ebd073ee7946f49005dd45071366eeb688`.
+Writing this page did not deploy, restart, SSH, open a pull request, or
+contact a host. Do not paste evidence, a unit dump, or an env file into
+chat. Output is key names, paths, worker names, and checksums. Secret
+values are not printed.
+
+The commands live in this branch's `docs/deploy/`. They are not in the
+`dcb3f950` tree or the `c08cb1e` tree. Copy this `docs/deploy/` directory
+onto the host that will run the command. Do not take the helpers from
+the checkout being deployed.
 
 Stop at the first non-zero exit. Steps 1–9 deploy. Steps 10–13 roll
 back. A successful deploy stops after step 9. A later step is not a
-repair. Re-pasting records a baseline once, refuses to replace it, and
+repair. Re-running records a baseline once, refuses to replace it, and
 skips a restart that already reached the revision it checks. It does
 not delete journals, reservations, tombstones, profile files, or the
 stable checkout.
-
-On the Control host, run `docs/deploy/c08cb1e-preflight.sh` before step
-1. It is strictly read-only and does not create the baseline.
-
-`6d6e25f` repeated one ~790-line Control Python prelude in steps 1, 4,
-5, 6, 7, 10, and 11. This page keeps those stop conditions once and
-keeps each step's action. Steps 8 and 12 are the step 2 command. Steps
-9 and 13 are the step 3 command.
 
 ## Pins
 
@@ -88,6 +86,17 @@ MCP `command`, `args`, and `cwd` does not match the fork.
 
 The running Control agent revision was not read.
 
+## What NRestarts measures
+
+`NRestarts` counts automatic restarts caused by the unit `Restart=`
+policy after an unclean exit. A manual `systemctl restart` does not
+increment it. A successful manual restart can leave `NRestarts` at 0.
+The restart commands print the value and this sentence. They do not
+require it to increase. Health is `ActiveState=active` and
+`SubState=running`. Identity is a new `MainPID` whose environment
+`HERMES_FLEET_CONTROL_ROOT` is the checkout that step is checking,
+with `FLEET_CONTROL_PYTHON` unset, plus the expected drop-ins.
+
 ## Assumptions
 
 Not read from a host. Commands stop when a check fails.
@@ -96,7 +105,7 @@ Not read from a host. Commands stop when a check fails.
   paste runs as root; user unit if it is the only one loaded. Stop if
   both or neither are loaded. No SSH.
 - Process environment, not only the unit text:
-  `HERMES_FLEET_CONTROL_ROOT` on the stable checkout,
+  `HERMES_FLEET_CONTROL_ROOT` on the checkout that step expects,
   `HERMES_FLEET_CONTROL_INTEGRATION=1`, `FLEET_CONTROL_PYTHON` unset.
 - `fleet-delegation.conf` is loaded. No drop-in name sorts after
   `fleet-retirement.conf`. The earlier temporary retirement drop-in is
@@ -104,13 +113,22 @@ Not read from a host. Commands stop when a check fails.
 - The Fleet MCP entry named by `HERMES_FLEET_MCP_SERVER` has the stable
   prefix in `command`, `args`, or `cwd`, or it uses
   `${HERMES_FLEET_CONTROL_ROOT}`. Any other stable-path occurrence stops
-  step 5.
-- Journal dirs (`fleet-delegations`, `fleet-onboarding`,
-  `fleet-retirements`, or absolute overrides) are non-empty and private.
-  Tombstones are on the Provisioner. Checksums only.
+  step 5. Arbitrary MCP argument strings are not printed.
+- Control journal dirs are the directories the deployed loaders use:
+  `FLEET_DELEGATION_JOURNAL_DIR` or
+  `<profiles>/<profile>/fleet-delegations`,
+  `FLEET_ONBOARD_JOURNAL_DIR` or `fleet-onboarding`, and
+  `FLEET_RETIRE_JOURNAL_DIR` or `fleet-retirements`. They are
+  non-empty and private. The manifest stores checksums and modes, not
+  file bodies.
+- Provisioner state comes from the deployed `resolve_state_dir` loader
+  on the running checkout. Journals are `onboarding/<name>.json`.
+  Tombstones are `tombstones/<name>.json`. A filename search is not
+  used. Bodies are not printed.
 - Provisioner `FLEET_PROVISIONER_GIT_REF` is absent. Exactly one active
   unit whose name contains `provisioner`, or is `hermes-fleet.service`
-  or `fleet-provisioner.service`, and at least one tombstone file.
+  or `fleet-provisioner.service`, and `tombstones/` has at least one
+  json file.
 - Node is 20 or newer. A second paste skips `npm ci` and
   `install-control-runtime` when the import and `npm ls` already match.
 - Control evidence:
@@ -118,7 +136,7 @@ Not read from a host. Commands stop when a check fails.
   as root, else
   `$HOME/.local/state/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`.
   Provisioner and guest-node witnesses are `/var/lib/hermes-control-deploy/`
-  and those pastes run as root. New directories, not profile journals.
+  and those commands run as root. New directories, not profile journals.
 
 ## Open questions
 
@@ -126,238 +144,102 @@ Not read from a host. Commands stop when a check fails.
 see the other machines. `not-on-this-host` stays open until steps 2
 and 3.
 
+Exit 0 means `diagnostic=completed` and `host-ready=yes`. Exit 4 means
+`diagnostic=completed` and `host-ready=no`. Exit 4 is not a crash and
+it is not a pass: a missing or unknown prerequisite did not pass. Do
+not start step 1 unless the exit is 0.
+
 1. Hostnames, and are the three roles separate?
 2. Is `hermes-gateway-control.service` a system unit or a user unit?
 3. Is the stable directory the full `dcb3f950…` name, and is
    `fleet-delegation.conf` still the last loaded drop-in?
 4. Absolute MCP checkout paths, or `${HERMES_FLEET_CONTROL_ROOT}`?
+   Argument values that are not a public interpreter name, a safe flag,
+   an interpolated root, or a checkout path are `redacted`.
 5. Is `FLEET_CONTROL_PYTHON` unset, and is `FLEET_PROVISIONER_GIT_REF`
    unset on the stable Provisioner?
-6. Provisioner unit name, and which directory holds its tombstones?
+6. Provisioner unit name, and which `onboarding/` and `tombstones/`
+   directories does the deployed state loader resolve?
 7. Does the gateway load `skills/fleet-delegation/SKILL.md` from this
    checkout or from a profile copy? This procedure does not copy the
    skill. Tool text travels with `index.js`. `skill-load=home-skills`
    means a copy under `HERMES_HOME/skills` exists; the fleet-tip loader
    prefers that over `skills.external_dirs`. That is not a process-map
    observation.
-8. Is the origin URL free of an embedded token? Step 4 stores the URL
-   in the new git config and does not print it. A token stays on disk.
-   `origin-embedded-token=present` is URL userinfo
-   (`https://user:secret@host/...`). Scp-style `git@host:path` is not.
+8. Is the origin URL free of an embedded token? Step 4 stops when URL
+   userinfo is present. It does not copy that URL into the new git
+   config and it does not print it. Scp-style `git@host:path` is not
+   userinfo.
 
 ## Control stops
 
-Stop, without printing a secret, if any of these hold. Key names and
-paths may be printed. Do not print values whose keys match `TOKEN`,
-`SECRET`, `PASSWORD`, `PRIVATE`, `NSEC`, `CREDENTIAL`, or `KEY`.
+The helpers stop, without printing a secret, when a check fails. Key
+names and paths may be printed. Do not print values whose keys match
+`TOKEN`, `SECRET`, `PASSWORD`, `PRIVATE`, `NSEC`, `CREDENTIAL`, or
+`KEY`.
 
 - Python 3.12 is missing or resolves inside the agent virtualenv.
-- Both unit scopes are loaded, or neither is. Scope is `systemctl` or
-  `systemctl --user`.
-- Gateway not active, or `MainPID` is not live.
+- Both unit scopes are loaded, or neither is.
+- Gateway not active and running, or `MainPID` is not a new live pid
+  after a restart that was supposed to change it.
 - `FLEET_CONTROL_PYTHON` is set. On step 1,
   `HERMES_FLEET_CONTROL_INTEGRATION` is not `1`. After step 6 the root
   is not the new checkout.
 - Stable directory is not exactly one `dcb3f950*` checkout at the pins.
-  Running root is neither that directory nor the new one. A child cwd
-  is a different `/opt/hermes-fleet-control/` checkout.
+  Running root is neither that directory nor the new one.
 - `fleet-delegation.conf` is not exactly one loaded regular file, or a
   loaded drop-in name sorts after `fleet-retirement.conf`.
 - A journal dir is missing, not private (`mode & 077`), empty, or holds
   a taken `*.lock`. After step 1, the sha256 manifest must match
   `journals.manifest`.
-- Fleet env file is not a regular file, lacks one
-  `FLEET_PROVISIONER_URL` and one `FLEET_PROVISIONER_CALLER_TOKEN`, or
-  contains `BUZZ_PRIVATE_KEY`, `BUZZ_FLEET_MEMBERSHIP_TOKEN`,
-  `LITELLM_MASTER_KEY`, or `PVE_TOKEN_SECRET`.
-- Profile `.env` is missing, not private, or lacks `BUZZ_PRIVATE_KEY`.
+- The stable git origin has URL userinfo, or its form is unknown.
+- Fleet env file is not a regular file. Profile `.env` is missing or
+  not private.
 - `config.yaml`, `fleet-delegation.conf`, profile `.env`, fleet env, or
   the unit fragment differs from the step 1 baseline, except the step 5
   rewrite recorded as `config.yaml.deployed`.
-- `fleet-status` names or identity projection differ from the baseline.
-  The projection keeps name, declared, retained, tombstone name and
-  vmid, observed state, public key hex, vmid, and onboarding id and
-  status.
-- Node or npm is missing. `git status --porcelain=v1 -uall` on the new
-  checkout shows anything outside untracked `runtime/` and
-  `fleet-mcp/node_modules/`.
+- Worker projection differs from the baseline. The projection keeps
+  name, declared, retained, tombstone name and vmid, observed state,
+  public key hex, vmid, and onboarding id and status.
+- `git status --porcelain=v1 -uall` on the new checkout shows anything
+  outside untracked `runtime/` and `fleet-mcp/node_modules/`.
 
 Step 1 writes the baseline only on the stable checkout with
 `fleet-retirement.conf` absent. Files: `journals.manifest`, copies of
 `fleet-delegation.conf`, `config.yaml`, the fleet env, the profile
-`.env`, and the unit fragment, plus `worker-names`,
-`worker-projection.json`, `mainpid`, `nrestarts`, and `stable_dir`.
-Copies are mode `0600`. The directory is mode `0700`. A later paste
-compares and does not replace them.
+`.env`, and the unit fragment, plus `mainpid`, `stable_dir`, and
+`config.mode`. Copies are mode `0600`. The directory is mode `0700`.
+A later command compares and does not replace them.
 
 ## 1. Control — baseline
 
-Run the preflight, then the reads above, and write that baseline.
-Print scope, `ActiveState`, `NRestarts`, `MainPID`, fragment, drop-in
-names, environment-file key names, process path keys, presence of
-`FLEET_CONTROL_PYTHON` and the token keys, journal dirs, MCP
-command/cwd/args (`[not-printed]` for an unsafe arg), worker names,
-`stable`, `running-root`, and `baseline=created` or `baseline=matched`.
-End `STEP 1 OK`. Do not restart or create the new checkout.
+On the Control host:
+
+```bash
+docs/deploy/c08cb1e-preflight.sh
+docs/deploy/c08cb1e_material.py baseline
+```
+
+The preflight must exit 0. `baseline` prints scope, `ActiveState`,
+`SubState`, `MainPID`, `NRestarts` with what that counter measures,
+drop-in names, fleet env key names, `FLEET_CONTROL_PYTHON=absent`, the
+journal manifest checksum, `stable`, `running-root`, and
+`baseline=created` or `baseline=matched`. It ends `STEP 1 OK`. It does
+not restart or create the new checkout.
 
 ## 2. Provisioner — witness
 
-On the Provisioner, as root. The first paste writes the witness. Steps
+On the Provisioner, as root. The first run writes the witness. Steps
 8 and 12 run this same command and only compare.
 
 ```bash
-bash -euo pipefail <<'BASH'
-echo "host-role=Provisioner hostname=$(hostname -s)"
-command -v python3 >/dev/null
-exec python3 - <<'PY'
-from __future__ import annotations
-
-import hashlib
-import os
-import re
-import stat
-import subprocess
-import sys
-from pathlib import Path
-
-EXPECTED = "b7f4a114ee2ef35b4ff0f1a2abd15efb248576fb"
-EVIDENCE = Path("/var/lib/hermes-control-deploy/c08cb1e-provisioner-witness")
-SECRET_KEY_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PRIVATE|NSEC|CREDENTIAL|KEY)$", re.IGNORECASE)
-
-
-def die(message: str) -> None:
-    sys.stderr.write("STOP: " + message + "\n")
-    raise SystemExit(1)
-
-
-def run(argv: list[str]) -> str:
-    completed = subprocess.run(argv, capture_output=True, text=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
-    if completed.returncode != 0:
-        die(f"command failed ({completed.returncode}): {argv[0]}")
-    return completed.stdout
-
-
-print(f"host-role=Provisioner hostname={os.uname().nodename}")
-if os.geteuid() != 0:
-    die("run this command as root on the Provisioner")
-if Path("/etc/pve").is_dir() and __import__("shutil").which("qm"):
-    die("this host looks like the guest node")
-control = subprocess.run(
-    ["systemctl", "show", "-p", "LoadState", "--value", "hermes-gateway-control.service"],
-    capture_output=True,
-    text=True,
-)
-if control.returncode == 0 and control.stdout.strip() == "loaded":
-    die("hermes-gateway-control.service is loaded; this is not the Provisioner command")
-listing = run(["systemctl", "list-units", "--type=service", "--all", "--plain", "--no-legend"])
-candidates = []
-for line in listing.splitlines():
-    if not line.strip():
-        continue
-    name = line.split()[0]
-    if name.startswith("hermes-gateway") or "hermes-fleet-control" in name:
-        continue
-    if "provisioner" in name or name in {"hermes-fleet.service", "fleet-provisioner.service"}:
-        state = run(["systemctl", "show", "-p", "ActiveState", "--value", name]).strip()
-        if state == "active":
-            candidates.append(name)
-if len(candidates) != 1:
-    die("expected exactly one active provisioner unit; found " + str(len(candidates)))
-unit = candidates[0]
-props = {}
-for line in run(["systemctl", "show", "-p", "MainPID", "-p", "NRestarts", "-p", "ActiveState", unit]).splitlines():
-    key, value = line.split("=", 1)
-    props[key] = value
-pid = int(props["MainPID"])
-if props["ActiveState"] != "active" or pid <= 1:
-    die("provisioner MainPID is not live")
-raw = Path(f"/proc/{pid}/environ").read_bytes()
-env = {}
-for item in raw.split(b"\0"):
-    if b"=" not in item:
-        continue
-    key, value = item.split(b"=", 1)
-    env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
-if env.get("FLEET_PROVISIONER_GIT_REF", "").strip():
-    die("FLEET_PROVISIONER_GIT_REF is set; stable provisioner was expected to have it absent")
-cwd = Path(os.path.realpath(f"/proc/{pid}/cwd"))
-top = run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"]).strip()
-head = run(["git", "-C", top, "rev-parse", "HEAD"]).strip()
-if head != EXPECTED:
-    die("provisioner checkout HEAD is not b7f4a114ee2ef35b4ff0f1a2abd15efb248576fb")
-porcelain = run(["git", "-C", top, "status", "--porcelain=v1", "-uall"])
-candidates_dirs = []
-for key, value in env.items():
-    if SECRET_KEY_RE.search(key) or not value.startswith("/") or re.search(r"\s", value):
-        continue
-    upper = key.upper()
-    if not any(token in upper for token in ("STATE", "DATA", "DIR", "ROOT", "JOURNAL", "TOMB", "HOME")):
-        continue
-    path = Path(value)
-    if path.is_dir() and not path.is_symlink() and str(path) not in {"/", "/root", "/home", "/var", "/opt"}:
-        candidates_dirs.append(path)
-candidates_dirs.append(cwd)
-seen = []
-for directory in candidates_dirs:
-    resolved = str(directory.resolve())
-    if resolved not in seen:
-        seen.append(resolved)
-found: list[Path] = []
-for directory in [Path(item) for item in seen]:
-    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
-        current = Path(dirpath)
-        depth = len(current.relative_to(directory).parts) if current != directory else 0
-        if depth > 5:
-            dirnames.clear()
-            continue
-        dirnames[:] = [name for name in dirnames if name not in {".git", "node_modules", "venv", "proc", "sys"}]
-        for name in filenames:
-            path = current / name
-            lowered = str(path).lower()
-            if "tombstone" in lowered or "journal" in lowered:
-                if path.is_symlink() or not path.is_file():
-                    die("witness path is not a regular file")
-                found.append(path)
-            if len(found) > 4000:
-                die("witness walk is too broad")
-tombstones = [path for path in found if "tombstone" in str(path).lower()]
-journals = [path for path in found if "journal" in str(path).lower()]
-if not tombstones:
-    print("candidate-dirs=" + ",".join(seen))
-    die("no tombstone file was found under the provisioner process paths")
-if not journals:
-    print("candidate-dirs=" + ",".join(seen))
-    die("no provisioner journal file was found under the provisioner process paths")
-lines = []
-for path in sorted(set(found), key=lambda item: str(item)):
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    mode = oct(stat.S_IMODE(path.lstat().st_mode))
-    lines.append(f"{digest} {mode} {path}")
-manifest = "\n".join(lines) + "\n"
-EVIDENCE.mkdir(parents=True, exist_ok=True)
-os.chmod(EVIDENCE, 0o700)
-identity = f"unit={unit}\npid={pid}\nnrestarts={props['NRestarts']}\nhead={head}\n"
-identity += "porcelain-sha256=" + hashlib.sha256(porcelain.encode("utf-8")).hexdigest() + "\n"
-manifest_path = EVIDENCE / "witness.manifest"
-identity_path = EVIDENCE / "identity"
-if not manifest_path.exists():
-    manifest_path.write_text(manifest, encoding="utf-8")
-    identity_path.write_text(identity, encoding="utf-8")
-    os.chmod(manifest_path, 0o600)
-    os.chmod(identity_path, 0o600)
-    print(f"unit={unit} pid={pid} nrestarts={props['NRestarts']} head={head}")
-    print(f"tombstones={len(tombstones)} journals={len(journals)}")
-    print("baseline=created")
-else:
-    if manifest_path.read_text(encoding="utf-8") != manifest or identity_path.read_text(encoding="utf-8") != identity:
-        die("provisioner witness changed")
-    print(f"unit={unit} pid={pid} nrestarts={props['NRestarts']} head={head}")
-    print(f"tombstones={len(tombstones)} journals={len(journals)}")
-    print("baseline=matched")
-print("PROVISIONER OK")
-PY
-BASH
+docs/deploy/c08cb1e-provisioner-witness.sh
 ```
+
+Require `baseline=created` the first time and `baseline=matched` later.
+The command resolves state with the deployed loader and counts
+`onboarding/*.json` and `tombstones/*.json`. It does not print those
+bodies.
 
 ## 3. Guest node — VM inventory
 
@@ -366,148 +248,76 @@ On the guest node, as root. That host is the one where `qm` and
 Steps 9 and 13 run this same command.
 
 ```bash
-bash -euo pipefail <<'BASH'
-echo "host-role=guest-node hostname=$(hostname -s)"
-test "$(id -u)" -eq 0
-command -v qm >/dev/null
-test -d /etc/pve
-if [[ "$(systemctl show -p LoadState --value hermes-gateway-control.service 2>/dev/null || true)" == "loaded" ]]; then
-  echo "STOP: hermes-gateway-control.service is loaded on this host" >&2
-  exit 1
-fi
-EVIDENCE=/var/lib/hermes-control-deploy/c08cb1e-guest-node-witness
-mkdir -p -- "$EVIDENCE"
-chmod 700 -- "$EVIDENCE"
-exec 9>"$EVIDENCE/lock"
-flock -n 9
-qm list | awk 'NR > 1 && $1 ~ /^[0-9]+$/ {
-  status = ""
-  for (i = 1; i <= NF; i++) if ($i ~ /^(running|stopped|paused)$/) status = $i
-  if (status != "") print $1, status
-}' | sort > "$EVIDENCE/qm-now.txt"
-if [[ ! -s "$EVIDENCE/qm-now.txt" ]]; then
-  echo "STOP: qm list produced no VMID/status rows" >&2
-  exit 1
-fi
-if [[ ! -f "$EVIDENCE/qm-baseline.txt" ]]; then
-  cp -- "$EVIDENCE/qm-now.txt" "$EVIDENCE/qm-baseline.txt"
-  chmod 600 -- "$EVIDENCE/qm-baseline.txt"
-  echo "baseline=created lines=$(wc -l < "$EVIDENCE/qm-baseline.txt")"
-else
-  cmp -s -- "$EVIDENCE/qm-now.txt" "$EVIDENCE/qm-baseline.txt"
-  echo "baseline=matched lines=$(wc -l < "$EVIDENCE/qm-baseline.txt")"
-fi
-echo "GUEST-NODE OK"
-BASH
+docs/deploy/c08cb1e-guest-node-witness.sh
 ```
+
+Require `baseline=created` the first time and `baseline=matched` later,
+and `GUEST-NODE OK`.
 
 ## 4. Control — install the checkout beside the stable one
 
 The stable checkout is only read. `NEW` is
 `/opt/hermes-fleet-control/c08cb1ebd073ee7946f49005dd45071366eeb688`.
 
-Stop if `NEW` exists and is not a git directory. Otherwise, when
-`NEW/.git` is absent:
-
 ```bash
-mkdir -p -- /opt/hermes-fleet-control
-git init --quiet /opt/hermes-fleet-control/c08cb1ebd073ee7946f49005dd45071366eeb688
+docs/deploy/c08cb1e_material.py install
 ```
 
-If `[remote "origin"]` is absent, copy the stable origin URL into
-`.git/config`. Do not print it. Then:
-
-```bash
-git -C /opt/hermes-fleet-control/c08cb1ebd073ee7946f49005dd45071366eeb688 fetch --quiet --no-tags origin c08cb1ebd073ee7946f49005dd45071366eeb688
-git -C /opt/hermes-fleet-control/c08cb1ebd073ee7946f49005dd45071366eeb688 checkout --quiet --detach c08cb1ebd073ee7946f49005dd45071366eeb688
-```
-
-Require `HEAD` and `HEAD^{tree}` to match the deploy pins. Do not force
-the worktree. Do not print fetch or checkout failure output. If
-`runtime/venv/bin/python` cannot import the locked `cryptography` and
-`PyYAML`:
-
-```bash
-/usr/bin/python3.12 /opt/hermes-fleet-control/c08cb1ebd073ee7946f49005dd45071366eeb688/install-control-runtime --python /usr/bin/python3.12
-```
-
-Stdout must be exactly `NEW/runtime/venv/bin/python`. Re-import from
-`cwd=/` and require `sys.prefix` to be that virtualenv. In
-`NEW/fleet-mcp`, `npm ls --omit=dev --depth=0` must succeed. Only if
-it fails, from that directory:
-
-```bash
-npm ci --ignore-scripts --no-audit --no-fund
-```
-
-Then `npm ls` again and `node --check` on `NEW/fleet-mcp/index.js`. Do
-not print `npm ci` output. Re-check the stable pins and the porcelain
-rule. Print `STEP 4 OK`.
+If the stable origin has URL userinfo, the command prints
+`origin-embedded-token=present` and `origin-copied=no`, then stops. It
+does not write that URL into the new git config. A credential-free
+origin is copied and not printed. The command then fetches and checks
+out the deploy commit, checks `HEAD` and `HEAD^{tree}`, installs the
+locked runtime when the import is missing, and runs `npm ci` only when
+`npm ls` fails. It ends `STEP 4 OK`.
 
 ## 5. Control — drop-in and config.yaml
 
-Require the baseline and the new virtualenv. Re-check journals and
-`fleet-delegation.conf`. Write `fleet-retirement.conf` next to it only
-if absent (mode `0644`). If present, the bytes must already be the
-header below plus the copied environment lines. Header:
-
-```
-# Checkout override for hermes-fleet-control c08cb1ebd073ee7946f49005dd45071366eeb688.
-# Loaded after fleet-delegation.conf. That file is not modified.
-[Service]
-Environment=HERMES_FLEET_CONTROL_ROOT=/opt/hermes-fleet-control/c08cb1ebd073ee7946f49005dd45071366eeb688
+```bash
+docs/deploy/c08cb1e_material.py configure
 ```
 
-Copy every other `Environment=` line from `fleet-delegation.conf` whose
-value contains the stable path. Skip `HERMES_FLEET_CONTROL_ROOT`. Stop
-if a secret-like key contains that path. Otherwise replace the prefix
-once. Save `fleet-retirement.conf.desired`.
-
-From the baseline `config.yaml`: leave it when the stable path is
-absent and `${HERMES_FLEET_CONTROL_ROOT}` is present
-(`config=interpolated`); leave it when the new path is present and the
-stable path is not (`config=unchanged`); otherwise replace every stable
-path with the new path. Stop if the stable path remains, if the YAML
-change is not only `mcp_servers.<name>.command`, `cwd`, or `args[n]`,
-or if a changed string is not that one-prefix swap. Install with
-`config.yaml.c08cb1e-tmp` opened `O_EXCL`, fsync, original mode and
-owner, then `os.replace`. Record `config.yaml.deployed` and
-`config.changed=yes`, or `config.changed=no` when no rewrite was
-needed. Any other live bytes are a stop. Print `STEP 5 OK`.
+Requires the baseline. Re-checks the journal manifest and
+`fleet-delegation.conf`. Writes `fleet-retirement.conf` beside it only
+if absent (mode `0644`); if present, the bytes must already match.
+Rewrites `config.yaml` only for
+`mcp_servers.<name>.command`, `cwd`, and `args[n]`, by one prefix swap,
+through `config.yaml.c08cb1e-tmp` opened `O_EXCL`, fsync, the original
+mode and owner, then `os.replace`. Prints `config=interpolated`,
+`config=unchanged`, or `config=rewritten`, then `STEP 5 OK`.
 
 ## 6. Control — reload and restart only this gateway
 
-Re-check journals, the desired drop-in, and the proposed `config.yaml`.
-If the live root is already the new checkout and the drop-in is loaded,
-print `restart=skipped` and `STEP 6 OK`. Otherwise the root must still
-be stable. Same scope as step 1:
-
 ```bash
-systemctl daemon-reload
-systemctl restart hermes-gateway-control.service
+docs/deploy/c08cb1e_material.py restart
 ```
 
-`systemctl --user` when step 1 selected the user unit. Require a new
-`MainPID`, `NRestarts` plus exactly one, the new root,
-`FLEET_CONTROL_PYTHON` unset, the new drop-in loaded,
-`fleet-delegation.conf` unchanged, children only on the new checkout,
-and the journal manifest unchanged. Print `STEP 6 OK`.
+Re-checks journals. If the live root is already the new checkout and
+the drop-in is loaded, prints `restart=skipped` and `STEP 6 OK`.
+Otherwise the root must still be stable. Same scope as step 1:
+`systemctl daemon-reload` and `systemctl restart` (with `--user` when
+step 1 selected the user unit). Requires `ActiveState=active`,
+`SubState=running`, a new `MainPID`, the new root,
+`FLEET_CONTROL_PYTHON` unset, both drop-ins loaded, and the journal
+manifest unchanged. `NRestarts` is printed and is not required to
+increase. Prints `STEP 6 OK`.
 
-## 7. Control — config, status, and tools
+## 7. Control — config and status
 
-Running root is the new checkout. Journals, `fleet-delegation.conf`,
-and `config.yaml` match the reviewed bytes. MCP `command`, `args`, and
-`cwd` do not name the stable checkout; they name the new checkout or
-`${HERMES_FLEET_CONTROL_ROOT}`. `fleet-status` names and projection
-match the baseline.
+```bash
+docs/deploy/c08cb1e_material.py verify
+```
 
-List tools with the new MCP SDK
-(`@modelcontextprotocol/sdk/dist/esm/client/index.js` and `stdio.js`),
-spawning `node` on `NEW/fleet-mcp/index.js`, cwd `NEW/fleet-mcp`, env
-only `PATH`, `HOME`, and `LANG=C`. Require `worker_status`,
-`ensure_worker`, `onboard_worker`, `delegate_worker`, and
-`retire_worker`. `send_message` must be absent. Do not call a tool.
-Print `STEP 7 OK`.
+Running root is the new checkout. Journals match the baseline.
+`config.yaml` does not name the stable checkout unless step 5 recorded
+`config=interpolated`. Prints `STEP 7 OK`.
+
+List tools with the new MCP SDK only after `STEP 7 OK`, spawning `node`
+on `NEW/fleet-mcp/index.js` with cwd `NEW/fleet-mcp` and env `PATH`,
+`HOME`, and `LANG=C`. Require `worker_status`, `ensure_worker`,
+`onboard_worker`, `delegate_worker`, and `retire_worker`.
+`send_message` must be absent. Do not call a tool. The helper
+`require_tools` enforces that set on the names the client returns.
 
 ## 8. Provisioner — witness unchanged
 
@@ -519,33 +329,32 @@ Run the step 3 command again. Require `baseline=matched`.
 
 ## 10. Control — roll back to the stable checkout
 
-Undo of steps 5 and 6 only. Compare journals first.
-`fleet-delegation.conf` must match its backup. Leave `config.yaml` if
-it is the baseline. If it is the proposed bytes, write the baseline
-back with the same `O_EXCL`, fsync, mode, owner, and `os.replace`. Any
-other bytes stop. If `fleet-retirement.conf` exists it must match
-`fleet-retirement.conf.desired`; copy it to
-`fleet-retirement.conf.removed`, then unlink it. If the root is already
-stable, the drop-in is gone, and `config.yaml` is the baseline, print
-`rollback=already-stable` and `STEP 10 OK` without restarting.
-Otherwise the same scope as step 6:
-
 ```bash
-systemctl daemon-reload
-systemctl restart hermes-gateway-control.service
+docs/deploy/c08cb1e_material.py rollback
 ```
 
-Require a new `MainPID`, `NRestarts` plus one, the stable root, the
-baseline config, and the drop-in absent from disk and from
-`DropInPaths`. The new directory stays on disk. Journals still match.
-Print `STEP 10 OK`.
+Undo of steps 5 and 6 only. Compares journals first.
+`fleet-delegation.conf` must match its backup. Restores `config.yaml`
+from the baseline with the same `O_EXCL`, fsync, mode, owner, and
+`os.replace` when the live bytes are the deployed bytes. Any other
+bytes stop. If `fleet-retirement.conf` matches the desired bytes, it
+is copied to `fleet-retirement.conf.removed` and unlinked. If the root
+is already stable, the drop-in is gone, and `config.yaml` is the
+baseline, prints `rollback=already-stable` and `STEP 10 OK` without
+restarting. Otherwise restarts the same scope and requires a new
+`MainPID`, active/running, the stable root, and the retirement drop-in
+absent. `NRestarts` is not required to increase. The new directory
+stays on disk. Journals still match. Prints `STEP 10 OK`.
 
-## 11. Control — confirm dcb3f950 is running
+## 11. Control — confirm the stable checkout is running
+
+```bash
+docs/deploy/c08cb1e_material.py confirm
+```
 
 Root and tree are the stable pins. The drop-in is not loaded and not
-on disk. `fleet-delegation.conf` and `config.yaml` match the baseline.
-Worker names and projection match. No child cwd is the new checkout.
-Print `STEP 11 OK`.
+on disk. Journals match. No gateway process cwd is the new checkout.
+An unreadable cwd stops. Prints `STEP 11 OK`.
 
 ## 12. Provisioner — still unchanged
 
