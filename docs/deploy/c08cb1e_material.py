@@ -52,6 +52,12 @@ NRESTARTS_MEASURES = (
     "A successful manual restart can leave NRestarts at 0."
 )
 PUBLIC_MCP = frozenset({"node", "npm", "python3", "python3.12"})
+ALLOWED_ABSOLUTE = frozenset({
+    "/usr/bin/node",
+    "/usr/bin/npm",
+    "/usr/bin/python3",
+    "/usr/bin/python3.12",
+})
 ALLOWED_FLAGS = frozenset({"--version", "--stdio"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 ENV_NAME_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)$")
@@ -2470,68 +2476,132 @@ def _reverse_fleet_paths(live: bytes, stable_dir: str) -> bytes | None:
     return updated.encode("utf-8")
 
 
-def _load_yaml_quiet(text: str) -> dict | None:
-    """Parse a mapping without printing the text or stopping the command."""
-    try:
-        import yaml
-    except ImportError:
+def _normalize_abs(value: str) -> str:
+    """Collapse slashes and '.' / '..' without touching the filesystem.
+
+    Leading '//' is collapsed too. Symlinks are not resolved, so a path
+    that does not exist is judged by its spelling.
+    """
+    return os.path.normpath(re.sub(r"/+", "/", value))
+
+
+def _stable_anchor(stable_dir: str) -> str | None:
+    if not stable_dir.startswith("/"):
         return None
-    try:
-        data = yaml.safe_load(text)
-    except Exception:
+    anchor = _normalize_abs(stable_dir)
+    if ".." in anchor.split("/"):
         return None
-    if not isinstance(data, dict):
+    if not anchor.startswith("/opt/hermes-fleet-control/"):
         return None
-    return data
+    if anchor == str(NEW) or anchor.startswith(str(NEW) + "/"):
+        return None
+    return anchor
+
+
+def _path_tokens(value: str) -> list[str]:
+    return [match.group(0) for match in re.finditer(r"/[A-Za-z0-9._/-]*", value)]
+
+
+def _checkout_kind(value: str, stable_dir: str) -> str | None:
+    """stable, new, or other when a token names a fleet checkout. None otherwise."""
+    kind = "stable" if FLEET_ROOT_VAR in value else None
+    for token in _path_tokens(value):
+        normalized = _normalize_abs(token)
+        if normalized == str(NEW) or normalized.startswith(str(NEW) + "/"):
+            return "new"
+        if normalized == "/opt/hermes-fleet-control" or normalized.startswith("/opt/hermes-fleet-control/"):
+            if normalized == stable_dir or normalized.startswith(stable_dir + "/"):
+                kind = "stable"
+                continue
+            return "other"
+    return kind
+
+
+def _text_checkout_problem(text: str, stable_dir: str) -> str | None:
+    """foreign-checkout or non-canonical-new. Stable paths and the variable are allowed.
+
+    A token is canonical when its spelling already starts with the new
+    checkout. A different spelling that normalizes to that checkout,
+    including '/opt/./', a repeated slash, or a leading '//', is
+    non-canonical-new. The substring check is not used for that case:
+    '//opt/...' contains the canonical path as a suffix.
+    """
+    canonical = False
+    noncanonical = False
+    other = False
+    for token in _path_tokens(text):
+        normalized = _normalize_abs(token)
+        if normalized == stable_dir or normalized.startswith(stable_dir + "/"):
+            continue
+        new_hit = normalized == str(NEW) or normalized.startswith(str(NEW) + "/")
+        if new_hit:
+            if token == str(NEW) or token.startswith(str(NEW) + "/"):
+                canonical = True
+            else:
+                noncanonical = True
+            continue
+        if normalized == "/opt/hermes-fleet-control" or normalized.startswith("/opt/hermes-fleet-control/"):
+            other = True
+    if canonical or other:
+        return "foreign-checkout"
+    if noncanonical:
+        return "non-canonical-new"
+    if str(NEW) in text:
+        return "foreign-checkout"
+    return None
+
+
+def _variable_anchored(value: str) -> bool:
+    if value == FLEET_ROOT_VAR:
+        return True
+    prefix = FLEET_ROOT_VAR + "/"
+    if not value.startswith(prefix):
+        return False
+    parts = [part for part in value[len(prefix) :].split("/") if part != "."]
+    if not parts or any(part in {"", ".."} for part in parts):
+        return False
+    return True
 
 
 def _anchored(value: str, stable_dir: str) -> bool:
     """True when value is the stable checkout, the checkout variable, or a child of either."""
-    if not value or ".." in value.split("/"):
+    if not value:
         return False
-    if value == stable_dir or value.startswith(stable_dir + "/"):
-        return True
-    if value == FLEET_ROOT_VAR or value.startswith(FLEET_ROOT_VAR + "/"):
-        return True
-    return False
+    if FLEET_ROOT_VAR in value:
+        return _variable_anchored(value) and _checkout_kind(value, stable_dir) == "stable"
+    if not value.startswith("/"):
+        return False
+    normalized = _normalize_abs(value)
+    return normalized == stable_dir or normalized.startswith(stable_dir + "/")
 
 
-def _foreign_checkout(text: str, stable_dir: str) -> bool:
-    """True when text names the new checkout or any other fleet checkout."""
-    if str(NEW) in text:
-        return True
-    for match in re.finditer(r"/opt/hermes-fleet-control/[A-Za-z0-9._/-]*", text):
-        path = match.group(0).rstrip("/")
-        if path == stable_dir or path.startswith(stable_dir + "/"):
-            continue
-        return True
-    return False
+def _nested_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        found: list[str] = []
+        for key, item in value.items():
+            found.extend(_nested_strings(key))
+            found.extend(_nested_strings(item))
+        return found
+    if isinstance(value, list):
+        found = []
+        for item in value:
+            found.extend(_nested_strings(item))
+        return found
+    return []
 
 
-def _mcp_field_strings(server: dict) -> list[str] | None:
-    fields: list[str] = []
-    command = server.get("command")
-    cwd = server.get("cwd")
-    if not isinstance(command, str) or not isinstance(cwd, str):
-        return None
-    fields.extend((command, cwd))
-    args = server.get("args", [])
-    if args is None:
-        args = []
-    if not isinstance(args, list):
-        return None
-    for item in args:
-        if not isinstance(item, str):
-            return None
-        fields.append(item)
-    return fields
+def _server_is_fleet(server: dict, stable_dir: str) -> bool:
+    """True when any nested string names a fleet checkout or the checkout variable."""
+    return any(_checkout_kind(item, stable_dir) is not None for item in _nested_strings(server))
 
 
 def _command_ok(command: str, stable_dir: str) -> bool:
     if command in PUBLIC_MCP or _anchored(command, stable_dir):
         return True
-    if command.startswith("/") and "/opt/hermes-fleet-control/" not in command:
-        return True
+    if command.startswith("/"):
+        return _normalize_abs(command) in ALLOWED_ABSOLUTE
     return False
 
 
@@ -2540,100 +2610,132 @@ def _arg_ok(arg: str, stable_dir: str) -> bool:
         return True
     if "/" not in arg and FLEET_ROOT_VAR not in arg:
         return True
-    if arg.startswith("/") and "/opt/hermes-fleet-control/" not in arg:
-        return True
+    if arg.startswith("/"):
+        return _normalize_abs(arg) in ALLOWED_ABSOLUTE
     return False
 
 
-def _fleet_mcp_compatible(text: str, stable_dir: str) -> bool:
-    """True when the one fleet MCP entry already targets the stable checkout.
-
-    Absence of the new checkout path is not enough. cwd must be the stable
-    directory, `${HERMES_FLEET_CONTROL_ROOT}`, or a child of one of those.
-    command and args must be that same anchor, a public interpreter, a
-    basename, or an absolute path outside the fleet checkouts. Any other
-    `/opt/hermes-fleet-control/` checkout, including the new one, is rejected.
-    """
-    if not stable_dir.startswith("/opt/hermes-fleet-control/") or stable_dir == str(NEW):
-        return False
-    if ".." in stable_dir.split("/"):
-        return False
-    if _foreign_checkout(text, stable_dir):
-        return False
-    data = _load_yaml_quiet(text)
-    if data is None:
-        return False
-    servers = data.get("mcp_servers")
-    if not isinstance(servers, dict) or not servers:
-        return False
-    fleet: list[dict] = []
-    for name, server in servers.items():
-        if not isinstance(name, str) or not isinstance(server, dict):
-            return False
-        fields = _mcp_field_strings(server)
-        if fields is None:
-            return False
-        if any(_anchored(item, stable_dir) for item in fields):
-            fleet.append(server)
-    if len(fleet) != 1:
-        return False
-    server = fleet[0]
-    cwd = server.get("cwd")
+def _validate_fleet_server(server: dict, stable_dir: str) -> str:
+    """Strict shape for the one fleet entry. Unrelated servers are not passed here."""
     command = server.get("command")
-    if not isinstance(cwd, str) or not isinstance(command, str):
-        return False
-    if not _anchored(cwd, stable_dir) or not _command_ok(command, stable_dir):
-        return False
+    cwd = server.get("cwd")
+    if not isinstance(command, str) or not isinstance(cwd, str):
+        return "fleet-entry-malformed"
+    if not _anchored(cwd, stable_dir):
+        return "cwd-not-anchored"
+    if not _command_ok(command, stable_dir):
+        return "command-not-allowed"
     args = server.get("args", [])
     if args is None:
         args = []
     if not isinstance(args, list):
-        return False
-    return all(isinstance(item, str) and _arg_ok(item, stable_dir) for item in args)
+        return "fleet-entry-malformed"
+    for item in args:
+        if not isinstance(item, str):
+            return "fleet-entry-malformed"
+        if not _arg_ok(item, stable_dir):
+            return "arg-not-allowed"
+    env = server.get("env")
+    if env is None:
+        return "compatible"
+    if not isinstance(env, dict):
+        return "fleet-entry-malformed"
+    for key, value in env.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return "fleet-entry-malformed"
+        if key == "HERMES_FLEET_CONTROL_ROOT":
+            return "env-overrides-root"
+        if _checkout_kind(value, stable_dir) is not None:
+            return "env-names-checkout"
+    return "compatible"
 
 
-def _config_plan(evidence: Path, config: Path, stable_dir: str) -> tuple[str, bytes | None]:
+def fleet_mcp_compatibility(text: str, stable_dir: str) -> str:
+    """Shared stable-MCP verdict for rollback and confirm.
+
+    Returns 'compatible' or a short token. The token is not file text and
+    not a secret. Unrelated url-only servers, command-only servers, and
+    non-string arguments on those unrelated servers are ignored. The one
+    fleet entry is strict. A non-string field does not hide a fleet entry
+    whose nested strings name a checkout. Paths are normalized without
+    resolving symlinks.
+    """
+    anchor = _stable_anchor(stable_dir)
+    if anchor is None:
+        return "stable-dir-unusable"
+    problem = _text_checkout_problem(text, anchor)
+    if problem is not None:
+        return problem
+    try:
+        import yaml
+    except ImportError:
+        return "yaml-unavailable"
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return "yaml-unparsed"
+    if not isinstance(data, dict):
+        return "yaml-unparsed"
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict) or not servers:
+        return "fleet-entry-missing"
+    fleet: list[dict] = []
+    for server in servers.values():
+        if not isinstance(server, dict):
+            continue
+        if _server_is_fleet(server, anchor):
+            fleet.append(server)
+    if not fleet:
+        return "fleet-entry-missing"
+    if len(fleet) != 1:
+        return "fleet-entry-ambiguous"
+    return _validate_fleet_server(fleet[0], anchor)
+
+
+def _config_plan(evidence: Path, config: Path, stable_dir: str) -> tuple[str, bytes | None, str]:
     """unchanged, restored, reversed, preserved, or incomplete. Does not write.
 
-    preserved means the live file is not the baseline but its fleet MCP
-    command, cwd, and args already target the stable checkout. The bytes
-    to write are returned only for restored and reversed.
+    The third value is a non-secret detail. preserved means the live file
+    is not the baseline but fleet_mcp_compatibility says it already targets
+    the stable checkout. The bytes to write are returned only for restored
+    and reversed.
     """
     baseline_file = evidence / "config.yaml"
     if baseline_file.is_symlink() or not baseline_file.is_file():
-        return "incomplete", None
+        return "incomplete", None, "baseline-missing"
     baseline = baseline_file.read_bytes()
     deployed_file = evidence / "config.yaml.deployed"
     deployed = deployed_file.read_bytes() if deployed_file.is_file() and not deployed_file.is_symlink() else None
     try:
         info = os.lstat(config)
     except OSError:
-        return "incomplete", None
+        return "incomplete", None, "config-unreadable"
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        return "incomplete", None
+        return "incomplete", None, "config-unreadable"
     try:
         live = config.read_bytes()
     except OSError:
-        return "incomplete", None
+        return "incomplete", None, "config-unreadable"
     if live == baseline and str(NEW).encode() not in live:
-        return "unchanged", None
+        return "unchanged", None, "byte-match"
     if deployed is not None and live == deployed and str(NEW).encode() not in baseline:
-        return "restored", baseline
+        return "restored", baseline, "byte-match"
     reversed_bytes = _reverse_fleet_paths(live, stable_dir)
     if reversed_bytes is not None and str(NEW).encode() not in reversed_bytes:
         try:
             reversed_text = reversed_bytes.decode("utf-8")
         except UnicodeDecodeError:
             reversed_text = ""
-        if reversed_text and _fleet_mcp_compatible(reversed_text, stable_dir):
-            return "reversed", reversed_bytes
+        if reversed_text and fleet_mcp_compatibility(reversed_text, stable_dir) == "compatible":
+            return "reversed", reversed_bytes, "compatible"
     try:
         text = live.decode("utf-8")
     except UnicodeDecodeError:
-        return "incomplete", None
-    if _fleet_mcp_compatible(text, stable_dir):
-        return "preserved", None
-    return "incomplete", None
+        return "incomplete", None, "not-utf8"
+    verdict = fleet_mcp_compatibility(text, stable_dir)
+    if verdict == "compatible":
+        return "preserved", None, "compatible"
+    return "incomplete", None, verdict
 
 
 def _dropin_plan(evidence: Path, delegation: Path) -> str:
@@ -2675,10 +2777,7 @@ def _apply_config(evidence: Path, config: Path, status: str, payload: bytes | No
         atomic_replace(config, payload)
         return
     if status == "preserved":
-        warn(
-            "config.yaml is not the baseline; fleet MCP command, cwd, and args "
-            "already reference the stable checkout"
-        )
+        warn("config.yaml is not the baseline; the fleet MCP entry already targets the stable checkout")
 
 
 def _apply_dropin_removal(evidence: Path, delegation: Path) -> None:
@@ -2840,6 +2939,7 @@ def _rollback_refuse(
     dropin_status: str,
     config_status: str,
     reason: str,
+    detail: str,
     completed: str = "none",
     incomplete: str = "dropin,config,restart",
 ) -> None:
@@ -2852,6 +2952,7 @@ def _rollback_refuse(
     out("dropin-rollback=" + dropin_status)
     out("config-rollback=" + config_status)
     out("rollback-reason=" + reason)
+    out("rollback-detail=" + detail)
     warn("do not restart the gateway until rollback completes")
     out("rollback=incomplete")
     die("rollback incomplete; operator intervention required")
@@ -2874,8 +2975,10 @@ def _cmd_rollback_locked() -> int:
     The retirement drop-in and config.yaml are classified before either
     is written. An unverified drop-in or a config that is not
     stable-compatible leaves both files untouched and does not restart.
-    rollback=done is printed only after the stable gateway has restarted
-    and passed its health checks, or when that gateway was already healthy.
+    A safe plan unlinks a verified drop-in, then writes config.yaml,
+    then reloads, then restarts. rollback=done is printed only after
+    the stable gateway has restarted and passed its health checks, or
+    when that gateway was already healthy.
     """
     evidence = evidence_root()
     _recorded, user = recorded_scope(evidence)
@@ -2903,7 +3006,7 @@ def _cmd_rollback_locked() -> int:
     dropin = delegation.with_name("fleet-retirement.conf")
     dropin_plan = _dropin_plan(evidence, delegation)
     config = stored_path(evidence, "config.path")
-    config_status, payload = _config_plan(evidence, config, stable)
+    config_status, payload, detail = _config_plan(evidence, config, stable)
     running = _running_root(before, env, stable)
     next_start = _next_start_root(dropin, _desired_dropin_bytes(evidence))
     names_new = _config_names_label(config)
@@ -2912,16 +3015,19 @@ def _cmd_rollback_locked() -> int:
             printed_dropin = "unverified"
             printed_config = "skipped"
             reason = "retirement drop-in is unverified"
+            printed_detail = "dropin-unverified"
             incomplete = "dropin,config,restart"
         elif dropin_plan == "removable":
             printed_dropin = "kept"
             printed_config = "incomplete"
             reason = "fleet mcp config is not stable-compatible"
+            printed_detail = detail
             incomplete = "dropin,config,restart"
         else:
             printed_dropin = "absent"
             printed_config = "incomplete"
             reason = "fleet mcp config is not stable-compatible"
+            printed_detail = detail
             incomplete = "config,restart"
         _rollback_refuse(
             running=running,
@@ -2930,6 +3036,7 @@ def _cmd_rollback_locked() -> int:
             dropin_status=printed_dropin,
             config_status=printed_config,
             reason=reason,
+            detail=printed_detail,
             incomplete=incomplete,
         )
     if config_status in {"restored", "reversed"} and (payload is None or str(NEW).encode() in payload):
@@ -2940,19 +3047,20 @@ def _cmd_rollback_locked() -> int:
             dropin_status="kept" if dropin_plan == "removable" else "absent",
             config_status="incomplete",
             reason="fleet mcp config is not stable-compatible",
+            detail="foreign-checkout",
             incomplete="dropin,config,restart" if dropin_plan == "removable" else "config,restart",
         )
-    _apply_config(evidence, config, config_status, payload)
-    out("config-rollback=" + config_status)
     if dropin_plan == "removable":
         _apply_dropin_removal(evidence, delegation)
         out("dropin-rollback=removed")
     else:
         out("dropin-rollback=absent")
+    _apply_config(evidence, config, config_status, payload)
+    out("config-rollback=" + config_status)
     if _config_names_new(config):
-        completed = "config" if config_status in {"restored", "reversed"} else "none"
-        if dropin_plan == "removable":
-            completed = completed + ",dropin" if completed != "none" else "dropin"
+        completed = "dropin" if dropin_plan == "removable" else "none"
+        if config_status in {"restored", "reversed"}:
+            completed = completed + ",config" if completed != "none" else "config"
         done = set() if completed == "none" else set(completed.split(","))
         remaining = [item for item in ("dropin", "config", "restart") if item not in done]
         _rollback_refuse(
@@ -2962,6 +3070,7 @@ def _cmd_rollback_locked() -> int:
             dropin_status="removed" if dropin_plan == "removable" else "absent",
             config_status=config_status,
             reason="config.yaml still names the new checkout",
+            detail="foreign-checkout",
             completed=completed,
             incomplete=",".join(remaining),
         )
@@ -2979,6 +3088,7 @@ def _cmd_rollback_locked() -> int:
             dropin_status="removed" if dropin_plan == "removable" else "absent",
             config_status=config_status,
             reason="config.yaml still names the new checkout",
+            detail="foreign-checkout",
             completed="dropin,restart",
             incomplete="config",
         )
@@ -3019,8 +3129,20 @@ def _cmd_confirm_locked() -> int:
     config = stored_path(evidence, "config.path")
     if config.is_symlink() or not config.is_file():
         die("config.yaml is missing")
-    if _config_names_new(config):
-        die("config.yaml names the new checkout")
+    try:
+        config_text = config.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        out("config-mcp=not-stable-compatible")
+        out("config-mcp-detail=config-unreadable")
+        die("config.yaml fleet mcp is not stable-compatible")
+    verdict = fleet_mcp_compatibility(config_text, stable)
+    if verdict != "compatible":
+        out("config-mcp=not-stable-compatible")
+        out("config-mcp-detail=" + verdict)
+        if str(NEW) in config_text:
+            die("config.yaml names the new checkout")
+        die("config.yaml fleet mcp is not stable-compatible")
+    out("config-mcp=stable-compatible")
     if _cwd_under(pid, NEW):
         die("a gateway process cwd is the new checkout")
     out("STEP 11 OK")
