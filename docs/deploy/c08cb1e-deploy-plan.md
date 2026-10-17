@@ -32,17 +32,25 @@ revision it checks is skipped. Rollback does not delete journals,
 reservations, tombstones, profile files, or the stable checkout. It
 does not overwrite a profile `.env`, the fleet env file, the unit
 fragment, or `fleet-delegation.conf`. A difference in those files is
-a warning. Rollback classifies the retirement drop-in and `config.yaml`
-before it writes either one. A safe plan unlinks a verified
-`fleet-retirement.conf`, then restores or reverse-rewrites
-`config.yaml`, then reloads. It does that only when the fleet MCP
-entry is stable-compatible. A file that already is, including
-unrelated edits and unrelated MCP servers, is left in place
+a warning. Run every helper command as the same user. On the guest that user is
+root. The evidence directory is the recovery record: leave it in
+place, mode `0700`, owned by that user, until rollback and confirm
+have finished. Rollback classifies the retirement drop-in and
+`config.yaml` before it writes either one and before it stops the
+unit. A plan that would refuse does not stop the gateway. A safe plan
+that must replace a running gateway stops the unit and checks that it
+stayed stopped, then unlinks a verified `fleet-retirement.conf`, then
+restores or reverse-rewrites `config.yaml`, then reloads, then
+starts. It does that only when the named fleet MCP entry is
+stable-compatible. A file that already is, including unrelated edits
+and unrelated MCP servers, is left in place
 (`config-rollback=preserved`). An unverified drop-in or a config that
-is not stable-compatible leaves both files untouched. Rollback does
-not restart, and it does not print `rollback=done`,
-`rollback=already-stable`, or `STEP 10 OK`, until the stable gateway
-is healthy. Re-running rollback after that success prints
+is not stable-compatible leaves both files untouched and does not
+stop the unit. A failure after the stop leaves the unit stopped and
+does not start an incompatible configuration. Rollback does not print
+`rollback=done`, `rollback=already-stable`, or `STEP 10 OK`, until
+the stable gateway is healthy. An already-healthy stable gateway is
+not stopped. Re-running rollback after that success prints
 `rollback=already-stable`. An interrupted rollback does not print
 those success lines.
 
@@ -166,12 +174,16 @@ Not read from a host. Commands stop when a check fails.
   `/var/lib/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`
   as root, else
   `$HOME/.local/state/hermes-control-deploy/c08cb1ebd073ee7946f49005dd45071366eeb688`.
-  Steps 1, 5, 6, 7, 10, and 11 must use the same execution identity
-  and that identity's evidence directory. A sudo rollback after a
-  user-unit baseline stops with `baseline is missing`. The helper
-  creates the evidence directory mode `0700`. A pre-existing parent or
-  evidence directory that is group or world writable, including mode
-  `0775` from umask `002`, is refused.
+  Every helper step on a host runs as that same execution identity.
+  The guest deployment uses root. Steps 1, 5, 6, 7, 10, and 11 share
+  that identity's evidence directory, and the later steps refuse a
+  different user. A sudo rollback after a user-unit baseline stops
+  with `baseline is missing`. The helper creates the evidence
+  directory mode `0700`. Keep that directory available and private
+  until confirm finishes; it holds the baseline identity used to
+  recover. A pre-existing parent or evidence directory that is group
+  or world writable, including mode `0775` from umask `002`, is
+  refused.
   The Provisioner witness and the guest-node witness are host mutations
   under `/var/lib/hermes-control-deploy/`, run as root. They are not
   read-only diagnostics and they are not profile journals. The files
@@ -293,28 +305,43 @@ names and paths may be printed. Do not print values whose keys match
   differs from the recorded bytes, except the step 5 rewrite recorded
   as `config.yaml.deployed`. Rollback does not stop on delegation drift.
   For `config.yaml`, rollback restores the baseline when the live bytes
-  are the deployed bytes, reverse-rewrites fleet MCP paths when that
-  swap leaves one stable-compatible fleet entry, and leaves that file
-  untouched when the live fleet entry is already stable-compatible
-  (`config-rollback=preserved`). Rollback and confirm use the same
-  check. Unrelated MCP servers, including a url-only server, a
-  command-only server, and non-string arguments on those servers, are
-  not the fleet entry. The fleet entry's command, cwd, args, and env
-  are strict. A path is judged by its normalized spelling, not by
-  resolving a symlink or requiring the path to exist. A non-canonical
-  spelling of the new checkout, another checkout, an absolute command
-  or argument outside the stable checkout and the interpreter
-  allowlist, or a fleet env value that names a checkout or sets
-  `HERMES_FLEET_CONTROL_ROOT`, is incomplete. Unrelated keys are kept.
-  An unverified retirement drop-in skips the config write. Without
-  PyYAML, only a byte-equal baseline or a byte-equal deployed config
-  proceeds. A spelling problem is still reported with its own detail.
-  Any other config is incomplete with
-  `rollback-detail=yaml-unavailable`. Confirm has no byte-equal bypass:
-  it stops with `config-mcp=not-stable-compatible` and
-  `config-mcp-detail=yaml-unavailable` when the file needs a parse, or
-  with the spelling detail when the text already names a bad checkout.
-  The helper does not install PyYAML.
+  are the deployed bytes, reverse-rewrites the named fleet MCP entry
+  when that swap is stable-compatible, and leaves the file untouched
+  when that entry is already stable-compatible
+  (`config-rollback=preserved`). Rollback, confirm, and step 1 use
+  `fleet_mcp_compatibility` on the server name recorded in
+  `mcp-server.name`. Another server is not selected because it
+  mentions the stable checkout. Unrelated MCP servers, including a
+  url-only server, a command-only server, and non-string arguments on
+  those servers, may mention stable paths. The named entry's command,
+  cwd, args, and env are strict. A path is judged by its normalized
+  spelling, not by resolving a symlink or requiring the path to exist.
+  Command and cwd must be the stable checkout, `${HERMES_FLEET_CONTROL_ROOT}`
+  plus a relative child, `node`, `npm`, `python3`, `python3.12`, or
+  exactly `/usr/bin/node`, `/usr/bin/npm`, `/usr/bin/python3`, or
+  `/usr/bin/python3.12`. An argument must be one of those, an anchored
+  checkout path, `--version`, `--stdio`, or a basename matching
+  `^[A-Za-z0-9._-]+\.(js|mjs|cjs)$` with no `/` and no `..`. Flags such
+  as `-e`, `--eval`, `-p`, `--print`, `--require`, `-r`, `-c`, and
+  `-m` are not in that set. A fleet env value may be a benign string,
+  the stable checkout, or the same variable form. The key
+  `HERMES_FLEET_CONTROL_ROOT` is refused even when its value is the
+  stable path. A non-canonical spelling of the new checkout, another
+  checkout anywhere in the file, a relative new-checkout cwd, or a
+  variable path that contains `..` is incomplete. Unrelated keys are
+  kept. An unverified retirement drop-in skips the config write and
+  does not stop the unit. Without PyYAML, step 1 cannot record a
+  baseline. Rollback still accepts a byte-equal baseline or a
+  byte-equal deployed config when `config.mcp-identity` matches those
+  baseline bytes. A spelling problem is still reported with its own
+  detail. Any other config is incomplete with
+  `rollback-detail=yaml-unavailable`. Confirm accepts that same
+  byte-identical verified baseline without PyYAML and prints
+  `config-mcp-detail=verified-baseline`. A modified file cannot use
+  that exception. Without PyYAML, confirm stops on any other file with
+  `config-mcp-detail=yaml-unavailable`, or with the spelling detail
+  when the text already names a bad checkout. The helper does not
+  install PyYAML.
 - `git status --porcelain=v1 -uall` on the new checkout, checked by
   install and verify, shows anything outside untracked `runtime/` and
   `fleet-mcp/node_modules/`.
@@ -326,7 +353,8 @@ does not spawn the Fleet MCP server.
 Step 1 writes the baseline only on the stable checkout with
 `fleet-retirement.conf` absent, including on a later re-run. Files:
 `journals.manifest`, copies of `fleet-delegation.conf`, `config.yaml`,
-the fleet env, the profile `.env`, and the unit fragment, plus
+`mcp-server.name`, `config.mcp-identity`, the fleet env, the profile
+`.env`, and the unit fragment, plus
 `mainpid`, `stable_dir`, `scope`, `config.mode`, `config.path`,
 `profile.env.path`, `fleet.env.path`, `unit.fragment.path`, and
 `delegation.path`. Copies are mode `0600`. The directory is mode
@@ -338,7 +366,13 @@ contains only expected names is discarded and rewritten on the next
 command. A partial directory is not a complete baseline. Do not
 delete journals to recover. An evidence directory written by an
 older helper, without a `scope` file, stops rollback with `baseline
-scope is missing`. If steps 5–6 were run with that older helper,
+scope is missing`. Evidence without `mcp-server.name` or a matching
+`config.mcp-identity` stops with `fleet-server-name-missing` or an
+identity mismatch. Do not invent the server name. If
+`fleet-retirement.conf` is absent and the gateway is still the stable
+checkout, remove that evidence directory and rerun step 1 as the same
+user. If a deploy is already in progress, do not delete the evidence
+and do not guess the name. If steps 5–6 were run with an older helper,
 roll back with that same helper version, then move the evidence
 directory aside. A new baseline is valid only while
 `fleet-retirement.conf` is absent.
@@ -372,7 +406,8 @@ replaced. It does not mean that run wrote nothing.
 
 - Step 1 creates the Control evidence directory (mode `0700`) and, once,
   mode `0600` files `journals.manifest`, `fleet-delegation.conf`,
-  `config.yaml`, `config.mode`, `fleet.env`, `profile.env`,
+  `config.yaml`, `mcp-server.name`, `config.mcp-identity`,
+  `config.mode`, `fleet.env`, `profile.env`,
   `unit.fragment`, `mainpid`, `stable_dir`, `scope`, `config.path`,
   `profile.env.path`, `fleet.env.path`, `unit.fragment.path`, and
   `delegation.path`. The manifest step opens an existing journal
@@ -418,21 +453,27 @@ replaced. It does not mean that run wrote nothing.
 - Step 7 reads. It does not write.
 - Steps 8 and 9 run the step 2 and step 3 commands again. Step 9 still
   truncates `lock` and replaces `qm-now.txt`.
-- Step 10, when both plans are safe, first copies a verified
-  `fleet-retirement.conf` to `fleet-retirement.conf.removed` (mode
-  `0600`) in the evidence directory and unlinks the drop-in. It then
-  replaces `config.yaml` from the baseline or with a reverse rewrite
-  of the fleet MCP paths, and chmod a baseline restore to the recorded
-  mode. A preserved or unchanged config is not written. An unverified
-  drop-in is not removed, and in that case `config.yaml` is not
-  written either, `daemon-reload` does not run, and the unit is not
-  restarted. After a safe unlink and config step it may run
-  `daemon-reload` and restart the same unit. It does not write the
+- Step 10 finishes the plan before it stops anything. An unverified
+  drop-in or an incompatible config is not removed, `config.yaml` is
+  not written, the unit is not stopped, `daemon-reload` does not run,
+  and the unit is not started. A safe plan that is not already the
+  healthy stable gateway stops the unit and requires `inactive` or
+  `failed`, `dead` or `failed`, `MainPID` 0, and no processes left in
+  the unit cgroup. `Restart=always`, `Restart=on-success`, an unknown
+  `Restart=` value, or an active socket, path, or timer in
+  `TriggeredBy` refuses before that stop. After a verified stop it
+  copies a verified `fleet-retirement.conf` to
+  `fleet-retirement.conf.removed` (mode `0600`) in the evidence
+  directory and unlinks the drop-in, then replaces `config.yaml` from
+  the baseline or with a reverse rewrite of the named fleet MCP entry,
+  and chmod a baseline restore to the recorded mode. A preserved or
+  unchanged config is not written. It then runs one `daemon-reload`
+  and `systemctl start` for the same unit. It does not write the
   removed copy beside the drop-in. It does not modify journals,
   reservations, tombstones, identities, credentials, profile `.env`,
   the fleet env, the unit fragment, or `fleet-delegation.conf`. A
-  refusal before any write does not restart and does not reload. A
-  crash after a write is not success. Do not restart the unit by hand
+  failure after the stop does not start the unit. A crash after a
+  write is not success. Do not start or restart the unit by hand
   until a later run prints `rollback=done` or `rollback=already-stable`.
 - Step 11 reads. Steps 12 and 13 repeat steps 2 and 3.
 
@@ -457,8 +498,16 @@ not print fleet env names or values. It also prints
 `/usr/bin/python3.12` outside the agent virtualenv, root for a system
 unit, `NeedDaemonReload=no`, delegation-drop-in location, and that
 `ExecStart`, `WorkingDirectory`, and `EnvironmentFile=` do not pin the
-checkout. It ends `STEP 1 OK`. It does not restart or create the new
-checkout. It stops if `fleet-retirement.conf` is already present.
+checkout. Before it writes evidence it runs `fleet_mcp_compatibility`
+on the live config, anchored at the stable checkout, for the server
+named by `HERMES_FLEET_MCP_SERVER`. A failure prints
+`config-mcp=not-stable-compatible` and `config-mcp-detail=` and does
+not create the evidence directory. Without PyYAML that detail is
+`yaml-unavailable` and step 1 cannot record a baseline. On success it
+records `mcp-server.name` and `config.mcp-identity` (`compatible` plus
+the sha256 of the config bytes). It ends `STEP 1 OK`. It does not
+restart or create the new checkout. It stops if
+`fleet-retirement.conf` is already present.
 
 ## 2. Provisioner — witness
 
@@ -607,100 +656,138 @@ and `side-file-drift=` with the drifted labels, or `side-file-drift=none`.
 Those files are not written. A delegation difference prints a warning
 and `delegation-drift=changed` and is not written.
 
-Rollback plans both writes before it changes either file. The
-retirement drop-in is removable only when it is the sibling
+Rollback plans both writes, and whether a stop is safe, before it
+changes either file and before it stops the unit. The retirement
+drop-in is removable only when it is the sibling
 `fleet-retirement.conf` of the stored delegation path, it is not a
 symlink, and its bytes equal `fleet-retirement.conf.desired`. Any
 other state is `unverified`. `config.yaml` is classified as
-`unchanged` when the live bytes are the baseline and do not name the
-new checkout, `restored` when the live bytes are
-`config.yaml.deployed` and the baseline does not name the new
-checkout, `reversed` when one safe swap of the new checkout path back
-to the stable directory leaves a stable-compatible fleet MCP entry,
-or `preserved` when the live bytes differ but
-`fleet_mcp_compatibility` reports the one fleet entry as compatible.
-Unrelated keys stay. Unrelated MCP servers stay. A third
-`/opt/hermes-fleet-control/` checkout, a non-canonical spelling of the
-new checkout, a cwd outside the stable anchor, an absolute command or
-argument that is not an allowlisted interpreter, a fleet env checkout
-reference, a fleet `HERMES_FLEET_CONTROL_ROOT` override, a missing or
-ambiguous fleet entry, or a missing PyYAML install is `incomplete`.
-The new checkout path anywhere else in the file is also `incomplete`.
+`unchanged` when the live bytes are the baseline, do not name the new
+checkout, and `config.mcp-identity` matches those bytes; `restored`
+when the live bytes are `config.yaml.deployed`, the baseline does not
+name the new checkout, and that same identity matches; `reversed`
+when one safe swap inside the named fleet entry leaves that entry
+stable-compatible; or `preserved` when the live bytes differ but
+`fleet_mcp_compatibility` reports the named entry as compatible.
+Unrelated keys stay. Unrelated MCP servers stay, including ones that
+mention a stable path. A third `/opt/hermes-fleet-control/` checkout,
+a non-canonical spelling of the new checkout, a cwd outside the
+stable anchor, an argument outside the allowlist, a fleet env value
+that is not anchored to the stable checkout or the checkout variable,
+a fleet `HERMES_FLEET_CONTROL_ROOT` override, a missing, renamed, or
+malformed fleet entry, a missing server-name record, or a missing
+PyYAML install is `incomplete`. The new checkout path anywhere else
+in the file is also `incomplete`.
 
 If the drop-in is unverified, or the config plan is incomplete, the
-command writes nothing. It does not remove the drop-in, does not
-rewrite `config.yaml`, does not `daemon-reload`, and does not restart.
-It prints `running-root` (`new`, `stable`, `none`, or `unknown`),
-`next-start-root` (`stable` when the drop-in is absent, `new` when the
-on-disk drop-in matches the desired bytes and sets the root to the new
-checkout, otherwise `unknown`), `config-names-new` (`yes`, `no`, or
-`unknown`), `rollback-completed`, `rollback-incomplete`,
-`dropin-rollback` (`unverified`, `kept`, or `absent`),
-`config-rollback` (`skipped` or `incomplete`), `rollback-reason`, and
-`rollback-detail`. The detail is a fixed token, not file text:
-`dropin-unverified`, `foreign-checkout`, `non-canonical-new`,
-`cwd-not-anchored`, `command-not-allowed`, `arg-not-allowed`,
-`env-overrides-root`, `env-names-checkout`, `fleet-entry-missing`,
-`fleet-entry-ambiguous`, `fleet-entry-malformed`, `yaml-unavailable`,
-`yaml-unparsed`, `baseline-missing`, `config-unreadable`, or
-`not-utf8`. It then prints
+command writes nothing and does not stop the unit. It does not remove
+the drop-in, does not rewrite `config.yaml`, does not `daemon-reload`,
+and does not start. It prints `running-root` (`new`, `stable`,
+`none`, or `unknown`), `next-start-root` (`stable` when the drop-in
+is absent, `new` when the on-disk drop-in matches the desired bytes
+and sets the root to the new checkout, otherwise `unknown`),
+`config-names-new` (`yes`, `no`, or `unknown`), `rollback-completed`,
+`rollback-incomplete`, `dropin-rollback` (`unverified`, `kept`, or
+`absent`), `config-rollback` (`skipped` or `incomplete`),
+`rollback-reason`, and `rollback-detail`. The detail is a fixed token,
+not file text: `dropin-unverified`, `foreign-checkout`,
+`non-canonical-new`, `cwd-not-anchored`, `command-not-allowed`,
+`arg-not-allowed`, `env-overrides-root`, `env-names-checkout`,
+`fleet-entry-missing`, `fleet-entry-malformed`,
+`fleet-server-name-missing`, `yaml-unavailable`, `yaml-unparsed`,
+`baseline-missing`, `config-unreadable`, `not-utf8`,
+`restart-policy-restarts-clean-stop`, `restart-policy-unknown`,
+`activation-unit-active`, `activation-unreadable`, `stop-failed`, or
+`stop-unverified`. It then prints
 `WARNING: do not restart the gateway until rollback completes`,
 `rollback=incomplete`, and
 `STOP: rollback incomplete; operator intervention required`.
 
-Without PyYAML, `unchanged` and `restored` still proceed because they
-compare bytes and do not parse the file. A spelling problem (literal
-new checkout, non-canonical new checkout, or another checkout path)
-is still `incomplete` with that detail. Any other live config is
-`incomplete` with `rollback-detail=yaml-unavailable`. Nothing is
-written and the unit is not restarted. The helper does not install
-PyYAML.
+Without PyYAML, `unchanged` and `restored` still proceed when the
+identity record matches, because they compare bytes and do not parse
+the file. A spelling problem (literal new checkout, non-canonical new
+checkout, or another checkout path) is still `incomplete` with that
+detail. Any other live config is `incomplete` with
+`rollback-detail=yaml-unavailable`. Nothing is written and the unit
+is not stopped. The helper does not install PyYAML. Step 1 cannot
+create a baseline without PyYAML.
 
-When both plans are safe, a removable drop-in is copied to
+A safe plan does not stop when the unit is already the healthy stable
+gateway: active and running, root already stable,
+`FLEET_CONTROL_PYTHON` unset, delegation loaded, the drop-in already
+absent, `NeedDaemonReload=no`, and the config `unchanged` or
+`preserved`. That command reloads, prints `rollback=already-stable`
+and `STEP 10 OK`, and does not start. Any other safe plan checks
+activation before the stop. `Restart=no`, `on-failure`, `on-abnormal`,
+`on-watchdog`, and `on-abort` may continue. `Restart=always` and
+`Restart=on-success` would start the unit again after a clean stop, so
+the command refuses with `restart-policy-restarts-clean-stop` and
+writes nothing. Any other `Restart=` value, including empty, is
+`restart-policy-unknown`. A socket, path, or timer named in
+`TriggeredBy` must be `inactive` or `failed`. An active one is
+`activation-unit-active`. An unreadable one is `activation-unreadable`.
+Those refusals do not stop the unit. An already-stopped unit is not
+refused for `Restart=` alone, because this command does not stop it
+again. A socket, path, or timer is still refused when it is active or
+unreadable.
+
+When the plan is safe and the unit is not already stable, the command
+runs `systemctl stop` unless the unit is already `inactive` or
+`failed` with `SubState` `dead` or `failed`, `MainPID` 0, and no
+processes in its cgroup. An already-inactive unit skips that stop and
+still starts at the end. A non-zero stop is `stop-failed`. A stop
+whose exit code is 0 is not enough: the following show must be
+`inactive` or `failed`, `dead` or `failed`, `MainPID` 0, and the unit
+cgroup must be empty. Otherwise the detail is `stop-unverified`.
+Either failure writes nothing and does not start.
+
+After a verified stop, a removable drop-in is copied to
 `fleet-retirement.conf.removed` in the evidence directory and unlinked
-first (`dropin-rollback=removed`). An already-absent drop-in prints
+(`dropin-rollback=removed`). An already-absent drop-in prints
 `dropin-rollback=absent`. A `restored` or `reversed` config is written
 after that unlink. A `preserved` or `unchanged` config is not written.
 `config-rollback=preserved` also prints a warning that the file was
-kept. `daemon-reload` runs only after that config step.
+kept. If the file still names the new checkout, the command refuses
+and does not start. `daemon-reload` runs only after that config step.
 `DropInPaths` must no longer list the retirement drop-in, with
-`NeedDaemonReload=no`. If the unit was already active and running, the
-root was already stable, `FLEET_CONTROL_PYTHON` was unset, delegation
-was loaded, the drop-in was already absent, and the config was
-`unchanged` or `preserved`, the command prints `rollback=already-stable`
-and `STEP 10 OK` without restarting. Otherwise it restarts the same
-scope and requires a new `MainPID`, active/running, the stable root,
-delegation loaded, the retirement drop-in unloaded, and
-`FLEET_CONTROL_PYTHON` unset. The restart waits about 10 seconds and
-re-reads. `NRestarts` is not required to increase. The new directory
-stays on disk. `rollback=done` and `STEP 10 OK` are printed only after
-that health check passes. Re-running the command after that success is
-safe: the config is `unchanged` or `preserved`, the drop-in is absent,
-and the command prints `rollback=already-stable`.
+`NeedDaemonReload=no`. A failed reload does not start. The command
+then runs `systemctl start` for the same scope and requires a new
+`MainPID`, active/running, the stable root, delegation loaded, the
+retirement drop-in unloaded, and `FLEET_CONTROL_PYTHON` unset. The
+start waits about 10 seconds and re-reads. `NRestarts` is not required
+to increase. The new directory stays on disk. `rollback=done` and
+`STEP 10 OK` are printed only after that health check passes.
+Re-running the command after that success is safe: the config is
+`unchanged` or `preserved`, the drop-in is absent, and the command
+prints `rollback=already-stable`.
 
-Unlink does not change systemd's loaded unit. The loaded unit changes
-at `daemon-reload`, which this command runs itself after the config
-write. A crash after the unlink and before the config write leaves the
-in-memory unit on the new checkout and leaves `config.yaml` naming
-that same checkout. `NeedDaemonReload=yes` until a later reload. A
-crash after the config write and before `daemon-reload` leaves the
-loaded unit on the new checkout while `config.yaml` names the stable
-checkout. An external `systemctl restart`, or a unit `Restart=`, in
-that window still starts the loaded new unit and then reads the stable
-MCP config. After `daemon-reload`, the next start uses the stable unit
-even if this command has not restarted yet. Do not restart by hand
-during rollback. A crashed run does not print `rollback=done`,
-`rollback=already-stable`, or `STEP 10 OK`. Re-running the command
-finishes a safe plan: a config that still names the new checkout is
-reversed or restored, and a config that is already stable-compatible
-is preserved.
+The unit is stopped before the drop-in and `config.yaml` change, so a
+crash between those writes does not leave the new unit running. The
+loaded unit still changes only at `daemon-reload`. A failure of the
+unlink, the config write, the reload, or the start leaves the unit
+stopped and does not start an incompatible configuration. A crashed
+run does not print `rollback=done`, `rollback=already-stable`, or
+`STEP 10 OK`. Re-running finishes a safe plan from the files on disk:
+a config that still names the new checkout is reversed or restored,
+and a config that is already stable-compatible is preserved. An
+already-stopped unit is not stopped again.
 
 ### Recovery when rollback is incomplete
 
-Do not run `systemctl restart` while the command printed
-`rollback=incomplete`. Use the printed `running-root`,
-`next-start-root`, and `config-names-new` lines. Do not paste
-`config.yaml`, the drop-in, or an env file into chat.
+Do not run `systemctl start` or `systemctl restart` while the command
+printed `rollback=incomplete`, and do not start a unit this command
+left stopped. Use the printed `running-root`, `next-start-root`, and
+`config-names-new` lines. Do not paste `config.yaml`, the drop-in, or
+an env file into chat. Keep the evidence directory in place.
+
+If the unit is stopped, leave it stopped and re-run rollback as the
+same user. A re-run does not need the unit to be active. It continues
+from the current drop-in and `config.yaml`. `rollback=done` is printed
+only after the start passes its health checks. If the detail is
+`stop-failed` or `stop-unverified`, the helper did not write and did
+not start. Do not assume a failed stop left the unit stopped. Inspect
+`ActiveState`, `SubState`, `MainPID`, and the unit cgroup, and re-run
+only when the plan is still safe.
 
 If `dropin-rollback=unverified`, compare `fleet-retirement.conf` with
 the evidence file `fleet-retirement.conf.desired` on the host. Do not
@@ -709,15 +796,18 @@ that desired file. Rollback will not delete an unverified drop-in and
 will not rewrite `config.yaml` until the drop-in is verified or absent.
 
 If `config-names-new=yes`, or `rollback-detail` names the fleet entry,
-edit only that fleet MCP entry so its command, cwd, and args name the
-stable checkout or `${HERMES_FLEET_CONTROL_ROOT}`, and remove a fleet
-env checkout reference or `HERMES_FLEET_CONTROL_ROOT` override. Leave
-unrelated keys and unrelated MCP servers in place. Re-run rollback.
-Use `rollback-detail` to see which check failed. A compatible file
-prints `config-rollback=preserved` and is not rewritten. When the
-drop-in is the verified desired file, that re-run removes it, reloads,
-and restarts the stable gateway. `rollback=done` is printed only after
-that restart passes its health checks. Then run step 11.
+edit only the fleet MCP entry named by `mcp-server.name` so its
+command, cwd, and args name the stable checkout or
+`${HERMES_FLEET_CONTROL_ROOT}`, and remove a fleet env checkout
+reference or `HERMES_FLEET_CONTROL_ROOT` override. An env value that is
+the stable checkout or `${HERMES_FLEET_CONTROL_ROOT}` plus a relative
+child may stay. Leave unrelated keys and unrelated MCP servers in
+place. Re-run rollback. Use `rollback-detail` to see which check
+failed. A compatible file prints `config-rollback=preserved` and is
+not rewritten. When the drop-in is the verified desired file, that
+re-run removes it, reloads, and starts the stable gateway.
+`rollback=done` is printed only after that start passes its health
+checks. Then run step 11.
 
 ## 11. Control — confirm the stable checkout is running
 
@@ -731,21 +821,29 @@ checkout, and `FLEET_CONTROL_PYTHON` is unset. `fleet-delegation.conf`
 is loaded. The retirement drop-in is not loaded and not on disk.
 `NeedDaemonReload=no`. A journal difference prints a warning and does
 not fail the command. Side-file drift is the same warning as rollback
-and is not modified. Confirm calls the same
-`fleet_mcp_compatibility` check as rollback. A compatible fleet entry
-prints `config-mcp=stable-compatible`. A missing, ambiguous, or
+and is not modified. A successful confirm prints
+`config-mcp=stable-compatible` and then `STEP 11 OK`. That MCP line is
+either `config-mcp-detail=verified-baseline`, when the live bytes are
+exactly the evidence `config.yaml`, `config.mcp-identity` is
+`compatible` plus the sha256 of those bytes, and the bytes do not name
+the new checkout, or it is the full `fleet_mcp_compatibility` pass for
+the recorded server name with no `verified-baseline` line. A modified
+file cannot use the baseline exception. A missing, renamed, or
 malformed fleet entry, a third checkout, an external fork, a
 non-canonical new-checkout path, or an incompatible command, cwd,
 argument, or env prints `config-mcp=not-stable-compatible` and
 `config-mcp-detail=` with the same token rollback uses, then stops.
 Unrelated MCP servers may remain. The file does not have to be
 byte-for-byte the baseline when a reverse rewrite or a preserved file
-kept unrelated keys. Without PyYAML, confirm stops with
-`config-mcp-detail=yaml-unavailable`. When the file contains the
+kept unrelated keys; that case needs PyYAML and does not print
+`verified-baseline`. Without PyYAML, the verified-baseline case still
+prints `STEP 11 OK`. Any other file stops with
+`config-mcp-detail=yaml-unavailable`, or with the spelling detail when
+the text already names a bad checkout. When the file contains the
 literal new checkout path, the stop line says `config.yaml names the
 new checkout`. No gateway process cwd is the new checkout. An
-unreadable cwd stops. Prints `STEP 11 OK` only after the shared check
-passes.
+unreadable cwd stops. `STEP 11 OK` is printed only after the
+verified-baseline shortcut or the shared check has passed.
 
 ## 12. Provisioner — still unchanged
 
