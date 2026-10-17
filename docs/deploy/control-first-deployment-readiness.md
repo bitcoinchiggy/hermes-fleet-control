@@ -221,11 +221,13 @@ The Gate B scope commands are listed in "Gate B command inventory".
 
 The authoritative Gate B list is the Final Gate B execution sheet.
 This section records what preflight does. The runnable form is
-required check R8. It sets `PYTHONDONTWRITEBYTECODE=1` and
-`PYTHONSAFEPATH=1` inside the target user's shell and removes
-`PYTHONPATH` and `PYTHONHOME` there. The wrapper does not clear the
-environment, so those variables reach `/usr/bin/python3.12`. The
-script takes no arguments. Extra arguments exit 2.
+required check R8. The root form uses `env -i` and keeps `HOME`,
+`PATH`, `LANG`, `PYTHONDONTWRITEBYTECODE`, and `PYTHONSAFEPATH`. The
+non-root form sets `PYTHONDONTWRITEBYTECODE=1` and `PYTHONSAFEPATH=1`
+inside the target user's shell and removes `PYTHONPATH` and
+`PYTHONHOME` there. The wrapper does not clear the environment, so
+the variables `env` passes reach `/usr/bin/python3.12`. The script
+takes no arguments. Extra arguments exit 2.
 
 | Field | Value |
 | --- | --- |
@@ -295,7 +297,7 @@ not describe this inventory as free of all filesystem effects.
 
 Write this record before any host command. It is not a host command.
 
-- Approved Control hostname: `<UNRESOLVED: approved Control hostname>`
+- Approved Control FQDN: `<UNRESOLVED: approved Control FQDN>`. R1 must print this string exactly. `hostname -f` may consult DNS or `/etc/hosts`.
 - `HELPER_DIR`: `<UNRESOLVED: absolute docs/deploy directory>`
 - `HELPER_PARENT`: `<UNRESOLVED: absolute parent of docs/deploy>`
 - `DEPLOY_USER`: `<UNRESOLVED: deploying user>`
@@ -326,14 +328,16 @@ command inventory is prohibited.
 #### Required checks
 
 R1. Host identity. Execution user: root. Run this before any other
-host-specific check.
+host-specific check. Compare the single output line with the exact
+FQDN recorded in the approval. `hostname -f` may consult DNS or
+`/etc/hosts` to produce that name.
 
 ```bash
 env PATH=/usr/sbin:/usr/bin:/sbin:/bin hostname -f
 ```
 
-STOP if the command fails or the single output line is not exactly the
-approved Control hostname.
+STOP if the command fails, prints nothing, or the single output line
+is not exactly the approved Control FQDN.
 
 R2. Helper directory listing. Execution user: root.
 
@@ -383,18 +387,29 @@ that commit are `5b0f3294b5ad0502777b6383262ceaf626ce20ea` for the
 shell wrapper and `39b31407c5bcdf20ec05f606a23448ce8ba7451c` for the
 Python helper.
 
-R5. Directory and parent trust. Execution user: root. This walks
-`HELPER_DIR` and every ancestor through `/`.
+R5. Directory and parent trust. Execution user: root. A relative
+`HELPER_DIR` is rejected before the walk. The walk then lists
+`HELPER_DIR` and every ancestor, and it stops when `dirname` returns
+the same path, which is the filesystem root for an absolute path.
+Read pass or fail from the `stat` columns `%U` and `%a`. The `ls -ld`
+type character is the symlink check.
 
 ```bash
-sh -c 'd="<HELPER_DIR>"; while :; do ls -ld "$d"; stat -c "%U:%G %a %F %n" "$d"; [ "$d" = / ] && break; d=$(dirname "$d"); done'
+sh -c 'd="<HELPER_DIR>"; case "$d" in /*) ;; *) echo STOP-not-absolute; exit 1;; esac; while :; do ls -ld "$d"; stat -c "%U:%G %a %F %n" "$d"; n=$(dirname "$d"); [ "$n" = "$d" ] && break; d=$n; done'
 ```
 
-STOP if any component is a symlink, is not a directory, is not owned
-by `root`, or is group-writable or world-writable. The last two mode
-digits must not be `2`, `3`, `6`, or `7`. An untrusted account that
-can modify a helper file, or replace the helper directory entry in its
-parent, is a STOP.
+STOP if the command prints `STOP-not-absolute` or exits before it
+reaches the filesystem root. STOP if any component is a symlink, is
+not a directory, is not owned by `root`, or is group-writable or
+world-writable. The last two mode digits must not be `2`, `3`, `6`,
+or `7`. An untrusted account that can modify a helper file, or
+replace the helper directory entry in its parent, is a STOP.
+
+When `DEPLOY_USER` is not root, that account must have traversal
+(execute) permission on every component, including `HELPER_DIR`. Case
+A ownership is `root`, so each mode must end in `5` or `7`. A missing
+execute bit is a STOP. Do not chmod, chown, or otherwise change
+permissions to make the path traversable.
 
 Case A is this result together with R2, R3, and R4: a root-owned tree
 the deploying account cannot modify, the exact five-file set, the
@@ -452,16 +467,29 @@ of the absolute helper path. That `exec` does not unset or rebuild the
 environment, so variables set in the invoking shell reach the
 interpreter. `/usr/bin/python3.12` is Python 3.11 or newer, so
 `PYTHONSAFEPATH` is not ignored by that version. `PYTHONSAFEPATH` must
-be a non-empty value. The command also removes `PYTHONPATH` and
-`PYTHONHOME` because `PYTHONSAFEPATH` does not suppress them.
+be a non-empty value. `PYTHONSAFEPATH` does not suppress `PYTHONPATH`.
 
-When `DEPLOY_USER` is root:
+When `DEPLOY_USER` is root, start from an empty environment and keep
+only the variables below. The wrapper finds `dirname` and `pwd` on
+`PATH`. Preflight does not call `evidence_root`. That function ignores
+`HOME` when the effective uid is 0. `Path.home()` follows `HOME` only
+if the live scope is a user unit and the delegation-location check
+runs; `HOME=/root` is the sensible root home for that call. Preflight
+does not read `USER`, `LOGNAME`, `TERM`, or `XDG_*` from its own
+environment. Child commands receive a new environment from `_run`.
+`LANG=C` matches that child environment. Dropping the rest also drops
+`BASH_ENV`, `ENV`, `CDPATH`, `PYTHONPATH`, `PYTHONHOME`,
+`PYTHONUSERBASE`, `PYTHONSTARTUP`, and `PYTHONINSPECT`.
 
 ```bash
-cd "<HELPER_PARENT>" && env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 docs/deploy/c08cb1e-preflight.sh
+cd "<HELPER_PARENT>" && env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 docs/deploy/c08cb1e-preflight.sh
 ```
 
-When `DEPLOY_USER` is not root:
+When `DEPLOY_USER` is not root, `sudo` `env_reset` already drops the
+caller's shell variables. The target shell still removes `PYTHONPATH`
+and `PYTHONHOME`, then sets the two Python variables. R5 must already
+show that this user can traverse every ancestor. If preflight cannot
+traverse the helper directory, STOP. Do not change permissions.
 
 ```bash
 sudo -u "<DEPLOY_USER>" sh -c 'cd "<HELPER_PARENT>" && env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 docs/deploy/c08cb1e-preflight.sh'
@@ -502,7 +530,7 @@ ls -l /home/hermes/.config/systemd/user/hermes-gateway-control.service /home/her
 
 ### Expected results
 
-R1: one line, the approved hostname.
+R1: one line, the approved Control FQDN.
 
 R2: two directory lines whose type character is not `l`, then the
 seven names listed above and no others.
@@ -512,8 +540,10 @@ R3: `root` owner, `regular file`, mode `644` for the plan markdown and
 
 R4: the two digest lines above.
 
-R5: every component is a root-owned directory, not a symlink, and not
-group-writable or world-writable.
+R5: the command reaches the filesystem root, and every component is a
+root-owned directory, not a symlink, and not group-writable or
+world-writable. For a non-root deploying user, every mode ends in `5`
+or `7`. `STOP-not-absolute` is a failure.
 
 R6: the deploying uid and name. For a non-root user, `HOME` equals the
 passwd home.
@@ -538,8 +568,10 @@ invoking user's manager after `XDG_RUNTIME_DIR` is cleared. Compare
 ### STOP conditions
 
 - The approval record is missing a hostname, `HELPER_DIR`, `HELPER_PARENT`, `DEPLOY_USER`, or the Fleet-idle assertion.
-- R1 fails, or the hostname differs from the approved Control hostname.
+- R1 fails, or the hostname differs from the approved Control FQDN. `hostname -f` may consult DNS or `/etc/hosts`. A failure or a mismatch is a STOP.
+- R5 prints `STOP-not-absolute`, or `HELPER_DIR` is not an absolute path.
 - R2, R3, R4, or R5 is not case A. Request a separate transfer authorization. Do not copy the files under this gate.
+- A non-root deploying user cannot traverse every helper-directory ancestor. Do not change permissions.
 - An untrusted account can modify the helper or replace its directory entry. Do not run preflight as root from a lower-trust writable directory.
 - R6 would select an unexpected evidence directory. For a non-root user that includes `HOME` differing from the passwd home.
 - `<scope>-journals=blocked`, or a Fleet delegate, onboard, or retire operation is in flight. Do not retry repeatedly or automatically.
@@ -582,10 +614,11 @@ assumption. This page does not change the helper.
 On a local CPython 3.12.3, which is not the Control host,
 `PYTHONSAFEPATH=1` sets `sys.flags.safe_path`. An empty value does not.
 `sys.flags.no_user_site` stays `0`, and `sys.flags.isolated` stays `0`.
-`PYTHONPATH` is still inserted on `sys.path`. The approved command
-removes `PYTHONPATH` and `PYTHONHOME` inside the target shell for that
-reason. System site-packages, `.pth` files, and the user site remain
-on the import path. R2 through R5 do not audit those locations.
+`PYTHONPATH` is still inserted on `sys.path`. The root command uses
+`env -i`, so `PYTHONPATH` and `PYTHONHOME` are absent. The non-root
+command removes both inside the target shell. System site-packages,
+`.pth` files, and the user site remain on the import path. R2 through
+R5 do not audit those locations.
 
 `EXEC_ENV_KEYS` refuses `PYTHONPATH`, `PYTHONHOME`, and
 `PYTHONSAFEPATH` on the fleet MCP environment during configure and
@@ -651,7 +684,7 @@ change.
 
 | Command | Class | Persistent effect | Transient effect |
 | --- | --- | --- | --- |
-| R8 in the Final Gate B execution sheet: `PYTHONDONTWRITEBYTECODE=1` and `PYTHONSAFEPATH=1`, with `PYTHONPATH` and `PYTHONHOME` removed, inside the deploying user's shell | READ-ONLY for persistent files. Not operationally noninterfering | No intentional deployment write. `PYTHONDONTWRITEBYTECODE=1` closes interpreter bytecode writes, including a missing stdlib `.pyc`. File reads may still update access times. `sudo`, when used, may append an authentication log and may update `/run/sudo/ts`. That is not Control deployment state | Shared non-blocking lock on journal `*.lock`, released before exit. A concurrent delegate, onboard, or retire can fail immediately with `delegation_in_flight`, `onboard_in_flight`, or `retire_in_flight`. Subprocess spawns listed in section 5. `node -p` executes that one expression |
+| R8 in the Final Gate B execution sheet. Root: `env -i` with `HOME=/root`, the fixed `PATH`, `LANG=C`, `PYTHONDONTWRITEBYTECODE=1`, and `PYTHONSAFEPATH=1`. Non-root: those two Python variables set inside the target shell, with `PYTHONPATH` and `PYTHONHOME` removed | READ-ONLY for persistent files. Not operationally noninterfering | No intentional deployment write. `PYTHONDONTWRITEBYTECODE=1` closes interpreter bytecode writes, including a missing stdlib `.pyc`. File reads may still update access times. `sudo`, when used, may append an authentication log and may update `/run/sudo/ts`. That is not Control deployment state | Shared non-blocking lock on journal `*.lock`, released before exit. A concurrent delegate, onboard, or retire can fail immediately with `delegation_in_flight`, `onboard_in_flight`, or `retire_in_flight`. Subprocess spawns listed in section 5. `node -p` executes that one expression |
 | `docs/deploy/c08cb1e_material.py baseline` | STATE-CHANGING | Creates the evidence parent when missing, chmod `0700`, then the evidence directory and mode `0600` baseline files through a staging rename. Does not restart and does not create the new checkout | Exclusive flock on the evidence parent, up to 20 seconds. Same journal shared-lock probe. Runs `fleet_mcp_compatibility` before the write |
 | `docs/deploy/c08cb1e-provisioner-witness.sh` | LOCAL-WRITE | Directory mode `0700` on every run. First run writes `witness.manifest` and `identity`. A matched run does not rewrite those two files | Imports and executes the deployed state-dir loader. Reads onboarding and tombstone files to hash them. Does not restart a service. The wrapper comment says it reads; the function and the runbook's write list are the authority |
 | `docs/deploy/c08cb1e-guest-node-witness.sh` | LOCAL-WRITE | Directory mode `0700`. Truncates `lock` and replaces `qm-now.txt` on every run, including a later match. First run creates `qm-baseline.txt` mode `0600`. `lock` and `qm-now.txt` follow the shell umask; the directory mode is what keeps them private | `qm list` is a hypervisor read. The script's redirects are the write. No guest start, stop, or destroy. Prints `read-only=no` before the writes |
@@ -776,7 +809,7 @@ Stop, and do not start the next step, when any of these are true.
 
 - This page is the only approval on hand. Gate A is not Gate B, C, D, E, or F. Gate A accepted the planning approach at `d04238aba3b2b107da57f0df8f80d52483d3b520`. This revised execution sheet still needs final acceptance.
 - The command's host, euid, or argv is not the one named in the approved gate.
-- `hostname -f` is not the hostname in the Gate B approval, or it cannot be verified.
+- `hostname -f` is not the exact approved Control FQDN, or it cannot be verified. `hostname -f` may consult DNS or `/etc/hosts`.
 - Helper provenance or directory trust is not case A. That includes an extra file, `__pycache__`, a symlink, a non-root owner, a wrong mode, a wrong digest, or a directory an untrusted account can modify.
 - Non-root execution would use a `HOME` that is not the deploying user's passwd home.
 - Preflight exits 4, 1, or 2. Exit 4 is a finished diagnostic that is not ready.
@@ -924,8 +957,8 @@ Hosts: UNRESOLVED until Gate B/D name them
     provenance and directory trust, executing-user identity, hermes
     user-manager visibility, and read-only preflight.
 [ ] Operator recorded Fleet idle before any Gate B command.
-[ ] Hostname matches the approved Control hostname before any other
-    host-specific check.
+[ ] Hostname -f matches the exact approved Control FQDN before any
+    other host-specific check. A failure or a mismatch is a STOP.
 [ ] Helper copy is case A: exact file set, root-owned, not writable by
     an untrusted account, modes 644 and 755, and both sha256 lines
     match. Otherwise STOP and request a separate transfer
